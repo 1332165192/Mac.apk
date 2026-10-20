@@ -1,8 +1,8 @@
 # Mac.apk App Compatibility
 
-Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-19.
+Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-20.
 
-**66 apps tested:** ✅ 52 work · ⚠️ 10 partly work · ❌ 4 don't work yet
+**71 apps tested:** ✅ 58 work · ⚠️ 10 partly work · ❌ 3 don't work yet
 
 **Legend:** ✅ yes · ⚠️ partly · ❌ not yet · ❔ not tested yet. **Works** means you can use the app or play the game; **Sound** means its audio plays. An app tested at more than one version has a row for each, newest first.
 
@@ -31,6 +31,7 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-19.
 | **Efteling** | 5.27.0 | ❌ | ❔ | Stuck on welcome screen. |
 | **Efteling** | 5.25.0 | ❌ | ❔ |  |
 | **Efteling** | 5.24.0 | ❌ | ❔ |  |
+| **Epic Games Store** | 1.7.2 | ✅ | ❔ | Icon: ❔. Signs in with Epic in a Mac.apk sign-in window and installs Rocket League Sideswipe. |
 | **F-Droid** | 1.23.2 | ✅ | ❔ | Updating Mindustry from F-Droid and then opening it from F-Droid WORKS (install + cross-app launch). |
 | **Feudal Tactics** | 1.5.2 | ✅ | ✅ |  |
 | **Flappy Bird** | 1.3 | ✅ | ✅ |  |
@@ -40,15 +41,18 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-19.
 | **Geometry Dash Lite** | 2.2.147 | ✅ | ✅ |  |
 | **Geometry Dash Lite** | 2.2.11 | ✅ | ✅ |  |
 | **Geometry Dash Meltdown** | 2.2.147 | ⚠️ | ✅ | Full-screen ads now play, but they still break the game afterwards. |
-| **Hill Climb Racing** | 1.71.1 | ❌ | ✅ | Draws its screen: ❌. 1.71.1 crashes at startup (found by the update check); 1.68.1 worked. |
+| **Hill Climb Racing** | 1.72.2 | ✅ | ✅ | 1.72.2 works. 1.71.1 crashed at startup. |
+| **Hill Climb Racing** | 1.71.1 | ❌ | ✅ |  |
 | **Hill Climb Racing** | 1.68.1 | ✅ | ✅ |  |
 | **Hill Climb Racing** | 1.43.0 | ✅ | ✅ |  |
 | **Hill Climb Racing** | 1.8.1 | ✅ | ✅ |  |
+| **iiSU** | 0.1.6.1 | ✅ | ❔ | Icon: ❔. Finds RetroArch and launches games in it. |
 | **Instagram** | 445.0.0.45.83 | ⚠️ | ❔ | Weird layout issues. Video choppy and sound inop |
 | **Jetpack 2** | 0.1.60 | ❌ | ❔ | Stuck loading at 59% |
 | **Jetpack Joyride** | 1.3.5 | ✅ | ✅ |  |
 | **Lemuroid** | 1.17.0 | ✅ | ❔ | Icon: ❔. Retro game emulator (F-Droid). Super Mario Advance 2 (GBA) plays. Downloads each system's emulator core on first use. |
 | **Mastodon** | 2.13.1 | ⚠️ | ✅ | Only shows one post |
+| **Metrolist** | 13.7.0 | ✅ | ✅ | Icon: ❔. YouTube Music client. Google sign-in and playback work, and it shows in macOS Now Playing. |
 | **mGrađani** | 1.0.18 | ✅ | ❔ | Icon: ❔. NIAS login page works since Mac.apk v1.0.1723 (it was blank before). |
 | **Mindustry** | 8-fdroid-160.5 | ✅ | ✅ | Online multiplayer currently inop |
 | **Mindustry** | 8-fdroid-158 | ✅ | ✅ |  |
@@ -65,7 +69,9 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-19.
 | **Plague Inc.** | 1.24.4 | ✅ | ✅ | 10-06: the very loud music and the gray bar over the in-game news ticker are fixed in the next Mac.apk update (after 1.0.1732); 1.0.1732 and earlier still have both. |
 | **Puzzles** | 2025-09-12-1919-23762278-fdroid | ✅ | ❔ |  |
 | **Reddit** | 2026.21.0 | ⚠️ | ✅ | Cannot log in via Google. Needs zoomed out when in full screen. Scrolling is odd. |
-| **Rocket League Sideswipe** | 1.12.5 | ✅ | ✅ | Works with a game controller. Sign in with Epic Games and online matches work. Can also be installed from the Epic Games Store app (needs the next Mac.apk release). The first launch shows a black screen for a while before the game starts. |
+| **RetroArch** | 1.22.2 | ✅ | ❔ | Icon: ❔. Games run when launched from RetroArch or from iiSU. To scroll the menu with a mouse wheel, turn on Settings > User Interface > Mouse Support. |
+| **Rhythm** | 5.5.499.1302-gh | ✅ | ✅ | Icon: ❔. Music player. Play and pause from macOS Now Playing work. |
+| **Rocket League Sideswipe** | 1.12.5 | ✅ | ✅ | Works with a game controller. Sign in with Epic Games and online matches work. Can also be installed from the Epic Games Store app. The first launch after an install shows a black screen for a while before the game starts. |
 | **Rocks 'n' Diamonds** | 4.2.2.0 | ✅ | ✅ |  |
 | **Shattered Pixel Dungeon** | 3.3.8 | ✅ | ✅ |  |
 | **Signal** | 8.20.4 | ✅ | ❔ |  |
@@ -84,4 +90,5 @@ Which Android apps run on Mac.apk, tested by hand on a Mac. Updated 2026-10-19.
 | **Unit Converter Ultimate** | 5.7.3 | ✅ | ❔ |  |
 | **Vector Pinball** | 1.15.2 | ✅ | ✅ |  |
 | **VLC** | 3.7.1 | ✅ | ❔ | Runs and can access your files after you grant All file access. |
-| **Wikipedia** | 50591-r-2026-06-02 | ✅ | ❔ | Night mode bugs. |
+| **Wikipedia** | 50610-r-2026-10-06 | ✅ | ❔ | Night mode bugs. |
+| **Wikipedia** | 50591-r-2026-06-02 | ✅ | ❔ |  |
