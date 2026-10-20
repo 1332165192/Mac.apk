@@ -23,7 +23,8 @@ Mac.apk runs Android apps directly on Apple Silicon. Apps launch as ordinary mac
 processes, draw through the Mac's GPU, and execute on the CPU at native speed. They
 appear in your Dock, get their own windows with a back button next to the traffic
 lights, resize and rotate like any Mac window, and switch between light and dark
-along with your Mac.
+along with your Mac. Android TV apps work from the keyboard, and game launchers can
+start your other installed apps.
 
 There is no emulator here, and no virtual machine. Nothing boots Android in the
 background, there is no Linux kernel running underneath, and nothing is interpreted
@@ -69,12 +70,13 @@ Mac.apk prepares it. Later launches are fast. Full details, updating, and the ap
 stores are in the [Installation](https://github.com/kksimp/Mac.apk/wiki/Installation) and
 [App stores](https://github.com/kksimp/Mac.apk/wiki/App-Stores) pages.
 
-> [!WARNING]
-> An Android app's saved data lives inside its own `.app`. Dragging the app to the
-> Trash deletes its saves; uninstall from the Mac.apk control panel instead.
+> [!NOTE]
+> Each app's data lives in `~/Library/Application Support/MacApk/<package>`, not
+> inside its `.app`. Dragging an app to the Trash leaves that data behind; **Uninstall**
+> in the Mac.apk window cleans it up and can keep your saves for a reinstall.
 > [More →](https://github.com/kksimp/Mac.apk/wiki/Managing-Apps)
 
-## Known issues in v1.0.2237
+## Known issues in v1.0.2279
 
 See [Known issues](https://github.com/kksimp/Mac.apk/wiki/Known-Issues) for this release, and the
 [compatibility list](COMPATIBILITY.md) for every app tested by hand.
