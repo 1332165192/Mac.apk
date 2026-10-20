@@ -251,6 +251,15 @@ fi
 BUILD_ID="$(grep -E 'static let id' "$PROJECT_DIR/launcher/BuildInfo.generated.swift" \
             | sed -E 's/.*"([^"]+)".*/\1/' || echo unknown)"
 
+# Open the GUI without this shell's harness settings (2026-10-19). `open` hands
+# the caller's environment to the app, and the launcher passes its own to every
+# app it opens: an install run from a test shell with MACAPK_NO_ACTIVATE=1
+# exported left the owner's control panel opening every app behind his windows.
+open_gui() {
+    env -u MACAPK_NO_ACTIVATE -u MACAPK_PAUSE_WHEN_HIDDEN -u MACAPK_INSTALL_LOCK_HELD \
+        -u MACAPK_INJECT_FILE -u MACAPK_DEBUG_HOSTKEY_FILE -u MACAPK_RECORD_INPUT \
+        -u MACAPK_EXTERNAL_URLS open "$@"
+}
 if [ "$NO_PROMOTE" -eq 1 ]; then
     echo ""
     echo "==> --no-promote: leaving $CANONICAL untouched."
@@ -259,7 +268,7 @@ if [ "$NO_PROMOTE" -eq 1 ]; then
     echo "    point of this flag -- but it means an app launched now is NOT"
     echo "    running the build you just made."
     echo "==> Opening $SRC_APP (build $BUILD_ID)..."
-    open "$SRC_APP"
+    open_gui "$SRC_APP"
 else
     # The promote is scripts/promote_app.sh -- atomic stage/swap/restore,
     # LaunchServices pruning, and the per-app stub restage. It used to be
@@ -313,7 +322,7 @@ else
 
     echo ""
     echo "==> Opening $CANONICAL (build $BUILD_ID)..."
-    open "$CANONICAL"
+    open_gui "$CANONICAL"
 fi
 
 echo ""

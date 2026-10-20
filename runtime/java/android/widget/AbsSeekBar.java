@@ -119,6 +119,24 @@ public abstract class AbsSeekBar extends ProgressBar {
     }
     public Drawable getThumb() { return mThumb; }
 
+    /** AOSP AbsSeekBar.onMeasure (android14 :881-897): ProgressBar's clamp, at
+     *  least as tall as the thumb. */
+    @Override
+    protected synchronized void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        Drawable d = getCurrentDrawable();
+        int thumbHeight = mThumb == null ? 0 : mThumb.getIntrinsicHeight();
+        int dw = 0, dh = 0;
+        if (d != null) {
+            dw = Math.max(getMinWidth(), Math.min(getMaxWidth(), d.getIntrinsicWidth()));
+            dh = Math.max(getMinHeight(), Math.min(getMaxHeight(), d.getIntrinsicHeight()));
+            dh = Math.max(thumbHeight, dh);
+        }
+        dw += getPaddingLeft() + getPaddingRight();
+        dh += getPaddingTop() + getPaddingBottom();
+        setMeasuredDimension(resolveSizeAndState(dw, widthMeasureSpec, 0),
+                resolveSizeAndState(dh, heightMeasureSpec, 0));
+    }
+
     public void setThumbOffset(int thumbOffset) { mThumbOffset = thumbOffset; invalidate(); }
     public int  getThumbOffset() { return mThumbOffset; }
 

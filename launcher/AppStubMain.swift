@@ -500,15 +500,19 @@ struct AppStubMain {
     static func installedBaseApk(androidRoot: URL, package: String? = nil) -> URL? {
         let fm = FileManager.default
         let appRoot = androidRoot.appendingPathComponent("data/app", isDirectory: true)
-        guard let nonces = try? fm.contentsOfDirectory(at: appRoot,
-                                                        includingPropertiesForKeys: nil,
-                                                        options: [.skipsHiddenFiles])
-        else { return nil }
+        // Names, not URLs: contentsOfDirectory(at:) hands back RESOLVED paths, and
+        // data/app is a link into the bundle since the app data moved out
+        // (AppDataLayout). The runtime needs the path as the guest sees it,
+        // <root>/data/app/~~<nonce>/<pkg>-<nonce>/base.apk: it checks that shape
+        // lexically (main.cpp install_dir) and reports it as sourceDir.
+        func children(_ dir: URL) -> [URL]? {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return nil }
+            return names.filter { !$0.hasPrefix(".") }
+                .map { dir.appendingPathComponent($0, isDirectory: true) }
+        }
+        guard let nonces = children(appRoot) else { return nil }
         for nonce in nonces.sorted(by: { $0.path < $1.path }) {
-            guard let pkgs = try? fm.contentsOfDirectory(at: nonce,
-                                                          includingPropertiesForKeys: nil,
-                                                          options: [.skipsHiddenFiles])
-            else { continue }
+            guard let pkgs = children(nonce) else { continue }
             // v1.0.1641: the PACKAGE's own install dir first. A stray
             // `<other>-<nonce>` (measured: Instagram's `base-Qm..`, left by a
             // manifest read that fell back to the file name) sorts before
@@ -624,11 +628,13 @@ struct AppStubMain {
         //    Uninstall does to it), so "canonical present but disabled" still
         //    correctly resolves to the canonical rather than wandering off to
         //    whatever LS remembers.
+        //
+        //    "The canonical path" is the fixed locations sourceContents() knows
+        //    (/Applications, then ~/Applications since GitHub #13), so a
+        //    per-user install resolves by path like /Applications does and LS
+        //    stays the fallback for anywhere else.
         var appCandidates: [URL] = []
-        let canonicalContents = URL(fileURLWithPath: "/Applications/Mac.apk.app/Contents",
-                                    isDirectory: true)
-        let canonicalHasPayload = fm.fileExists(
-            atPath: canonicalContents.appendingPathComponent("Resources/macapk-runtime").path)
+        let canonicalHasPayload = RuntimeInstall.sourceContents() != nil
         if !canonicalHasPayload,
            let ls = NSWorkspace.shared.urlForApplication(
                 withBundleIdentifier: "org.macapk.launcher") {
@@ -636,6 +642,16 @@ struct AppStubMain {
         }
         let sourceContents = RuntimeInstall.sourceContents(extra: appCandidates)
         let macapkApp = sourceContents?.deletingLastPathComponent()
+        // Tell the runtime which Mac.apk.app this is. The staged runtime ships
+        // no install helper and no location helper, so the guest side looks
+        // them up in the control panel (PackageInstallerBackend.locateHelper,
+        // LocationBridge.locateHelper); with Mac.apk outside /Applications they
+        // would otherwise find nothing (store installs and the location prompt
+        // fail). An explicit MACAPK_CANONICAL_APP from the caller wins.
+        if let app = macapkApp,
+           (ProcessInfo.processInfo.environment["MACAPK_CANONICAL_APP"] ?? "").isEmpty {
+            setenv("MACAPK_CANONICAL_APP", app.path, 1)
+        }
 
         // Self-heal, part one: THIS FILE. The stub inside a generated bundle
         // is a copy of Mac.apk.app's template, frozen at install time; after
@@ -706,7 +722,7 @@ struct AppStubMain {
                      + "Open Mac.apk and choose Runtime: Install to make it work again."
             } else if !st.sourceAvailable {
                 body = "\(label) runs on the Mac.apk runtime, but Mac.apk.app could not "
-                     + "be found at /Applications/Mac.apk.app or via Launch Services, "
+                     + "be found in /Applications, ~/Applications or via Launch Services, "
                      + "so there is nothing to install the runtime from. "
                      + "Install Mac.apk and try again."
             } else {
@@ -728,9 +744,108 @@ struct AppStubMain {
         }
         stubLog("resolved runtime: \(runtime.path)")
 
-        // 4. Our payload: the installed package and the app-data tree, both
-        //    inside this bundle (that containment is the uninstall story:
-        //    trashing the bundle removes the app AND its data).
+        let androidRoot = contents.appendingPathComponent("android", isDirectory: true)
+
+        // 4. Single instance. flock on run/<identity>.pid is the aliveness
+        //    signal (released by the kernel when the holder dies, so no
+        //    stale-pid heuristics). The fd is opened WITHOUT O_CLOEXEC on
+        //    purpose: it must survive the execv below so the lock lives
+        //    exactly as long as the runtime process.
+        //
+        //    Keyed by DIRNAME, not package (audit S8f): the registry's row
+        //    identity is dirName precisely because several versions of one
+        //    package legitimately coexist (three hillclimb rows on the live
+        //    machine, one .app per version by owner decision). A
+        //    package-keyed pidfile made the second version's stub "activate"
+        //    the OTHER version instead of launching -- breaking the
+        //    documented A/B workflow. Pre-dirName bundles fall back to the
+        //    package key, which for them is the old behaviour.
+        //
+        //    Taken BEFORE the payload is resolved (it used to come after):
+        //    moving the app's data out of the bundle (step 5) must never race a
+        //    running copy of the app, and the lock is what proves there is none.
+        let runDir = Paths.runDir
+        try? fm.createDirectory(at: runDir, withIntermediateDirectories: true)
+        let pidPath = runDir.appendingPathComponent("\(dirName ?? package).pid").path
+        let fd = open(pidPath, O_RDWR | O_CREAT, 0o644)
+        // Whether THIS launch holds the lock. Only then may step 5 move the
+        // app's data: a stale lock (below) means an orphaned helper of the last
+        // run may still be writing into the tree.
+        var holdsLock = false
+        if fd >= 0 {
+            if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                // A live holder: bring the existing instance forward instead
+                // of double-launching. The pid in the file targets the
+                // activation; the flock already proved liveness.
+                var text = ""
+                if let h = FileHandle(forReadingAtPath: pidPath),
+                   let d = try? h.readToEnd() {
+                    text = String(decoding: d, as: UTF8.self)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                // A STALE lock: the pid we wrote is gone, yet the flock is still
+                // held. That is a process that inherited the lock fd from an
+                // instance that has since quit (a helper it spawned before the
+                // runtime marked the fd close-on-exec, or a guest fork that
+                // outlived it). Activating the dead pid did nothing and the app
+                // simply never opened (owner, 2026-10-19: "apps are launching
+                // in the background again"). The app is not running, so launch
+                // it -- without the lock this once, which only costs its
+                // permission dialogs until the orphan exits.
+                let holderPid = Int32(text) ?? 0
+                if holderPid > 0 && kill(holderPid, 0) != 0 && errno == ESRCH {
+                    stubLog("WARN: pidfile \(pidPath) is locked but pid \(holderPid) is gone "
+                            + "(an orphaned child holds the lock); launching anyway")
+                    close(fd)
+                } else {
+                    stubLog("already running (pidfile \(pidPath) locked, pid=\(text)); activating")
+                    // A browser link LaunchServices sent to THIS process goes to
+                    // the running instance, as a browser's start reaches the
+                    // running task on a device (LaunchUrlHandoff below).
+                    LaunchUrlHandoff.forward(bundleRoot: bundleRoot, androidRoot: androidRoot)
+                    if let pid = Int32(text),
+                       let running = NSRunningApplication(processIdentifier: pid) {
+                        // v1.0.1642: BACK at an app's launcher root hides it (the
+                        // macOS stand-in for Android's "task moved behind home").
+                        // Opening the app again must bring it back, as tapping its
+                        // icon does on a device; unhide is what fires the runtime's
+                        // NSApplicationDidUnhideNotification -> the task resumes.
+                        if running.isHidden { _ = running.unhide() }
+                        running.activate(options: [])
+                    }
+                    exit(0)
+                }
+            } else {
+                holdsLock = true
+                ftruncate(fd, 0)
+                lseek(fd, 0, SEEK_SET)
+                let pidText = "\(getpid())\n"
+                _ = pidText.withCString { write(fd, $0, strlen($0)) }
+                // fd intentionally left open (and inherited) across execv.
+            }
+        } else {
+            stubLog("WARN: cannot open pidfile \(pidPath) (errno \(errno)); "
+                    + "continuing without single-instance protection")
+        }
+
+        // 5. The app's data lives OUTSIDE the bundle, in
+        //    ~/Library/Application Support/MacApk/<package> (AppDataLayout).
+        //    A bundle from before that layout is moved over here, once, under
+        //    the lock above; a moved one gets its data folder re-created if the
+        //    user deleted it (clear data) and its link back to the bundle
+        //    repaired if the bundle was moved. The runtime is still handed
+        //    Contents/android (now a link), so every guest-visible path is
+        //    unchanged. Never fatal: on any failure the data stays where it is.
+        //    Without the lock (stale lock, or no pidfile) only the repairs run;
+        //    the move waits for a launch that holds it.
+        AppDataLayout.ensure(bundle: bundleRoot, package: package, mayMove: holdsLock,
+                             log: { stubLog($0) })
+
+        // 6. Our payload: the installed package and the app-data tree, both
+        //    reached through Contents/android. Since v1.0.2251 the tree lives
+        //    in the app's data folder and data/app links back to this
+        //    bundle's Contents/app (step 5), so the paths below are the ones
+        //    they always were.
         //
         //    The installed base.apk under android/data/app is THE app (the
         //    Android layout; one copy, nothing retained anywhere else). A
@@ -739,10 +854,7 @@ struct AppStubMain {
         //    the runtime lays the install dir down (apk_unpacker.cpp
         //    EnsureInstalledPackage), and from the next launch on the
         //    Resources copy is redundant and removed here -- the stub owns
-        //    the bundle, and the seal was never going to survive the app's
-        //    own writes under Contents/android anyway (BundleGenerator's
-        //    adHocSign note).
-        let androidRoot = contents.appendingPathComponent("android", isDirectory: true)
+        //    the bundle.
         // v1.0.1641: an in-place store update that died mid-way is undone here,
         // before we pick what to launch (InPlaceRecovery).
         InPlaceRecovery.recoverIfInterrupted(androidRoot: androidRoot,
@@ -795,63 +907,7 @@ struct AppStubMain {
                        exitCode: 73)
         }
 
-        // 5. Single instance. flock on run/<identity>.pid is the aliveness
-        //    signal (released by the kernel when the holder dies, so no
-        //    stale-pid heuristics). The fd is opened WITHOUT O_CLOEXEC on
-        //    purpose: it must survive the execv below so the lock lives
-        //    exactly as long as the runtime process.
-        //
-        //    Keyed by DIRNAME, not package (audit S8f): the registry's row
-        //    identity is dirName precisely because several versions of one
-        //    package legitimately coexist (three hillclimb rows on the live
-        //    machine, one .app per version by owner decision). A
-        //    package-keyed pidfile made the second version's stub "activate"
-        //    the OTHER version instead of launching -- breaking the
-        //    documented A/B workflow. Pre-dirName bundles fall back to the
-        //    package key, which for them is the old behaviour.
-        let runDir = Paths.runDir
-        try? fm.createDirectory(at: runDir, withIntermediateDirectories: true)
-        let pidPath = runDir.appendingPathComponent("\(dirName ?? package).pid").path
-        let fd = open(pidPath, O_RDWR | O_CREAT, 0o644)
-        if fd >= 0 {
-            if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-                // A live holder: bring the existing instance forward instead
-                // of double-launching. The pid in the file targets the
-                // activation; the flock already proved liveness.
-                var text = ""
-                if let h = FileHandle(forReadingAtPath: pidPath),
-                   let d = try? h.readToEnd() {
-                    text = String(decoding: d, as: UTF8.self)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-                stubLog("already running (pidfile \(pidPath) locked, pid=\(text)); activating")
-                // A browser link LaunchServices sent to THIS process goes to
-                // the running instance, as a browser's start reaches the
-                // running task on a device (LaunchUrlHandoff below).
-                LaunchUrlHandoff.forward(bundleRoot: bundleRoot, androidRoot: androidRoot)
-                if let pid = Int32(text),
-                   let running = NSRunningApplication(processIdentifier: pid) {
-                    // v1.0.1642: BACK at an app's launcher root hides it (the
-                    // macOS stand-in for Android's "task moved behind home").
-                    // Opening the app again must bring it back, as tapping its
-                    // icon does on a device; unhide is what fires the runtime's
-                    // NSApplicationDidUnhideNotification -> the task resumes.
-                    if running.isHidden { _ = running.unhide() }
-                    running.activate(options: [])
-                }
-                exit(0)
-            }
-            ftruncate(fd, 0)
-            lseek(fd, 0, SEEK_SET)
-            let pidText = "\(getpid())\n"
-            _ = pidText.withCString { write(fd, $0, strlen($0)) }
-            // fd intentionally left open (and inherited) across execv.
-        } else {
-            stubLog("WARN: cannot open pidfile \(pidPath) (errno \(errno)); "
-                    + "continuing without single-instance protection")
-        }
-
-        // 6. Record the launch in the registry (the UI's "last launched"
+        // 7. Record the launch in the registry (the UI's "last launched"
         //    column). Bounded: touchLastLaunched gives up past timeoutMs
         //    rather than delaying the app start, so an unconditional call on
         //    the launch path is safe. Runs only for a REAL start (the
@@ -890,7 +946,7 @@ struct AppStubMain {
             stubLog("registry: skipped bundle reconcile (\(error.localizedDescription))")
         }
 
-        // 7. Environment, matching the launcher's launch() contract so the
+        // 8. Environment, matching the launcher's launch() contract so the
         //    runtime presents this process as the app: cocoa_bridge.mm
         //    adopts Dock icon + window title from MACAPK_APP_ICON /
         //    MACAPK_APP_LABEL / MACAPK_DEFAULT_ICON. Cache dir points at the
@@ -955,7 +1011,7 @@ struct AppStubMain {
             }
         }
 
-        // 8. Open the run log and point stderr at it, so this launch leaves
+        // 9. Open the run log and point stderr at it, so this launch leaves
         //    evidence. Must be the LAST thing before execv: everything above
         //    can still fatalAlert, and a modal the user reads beats a file
         //    nobody knows about. The stub's own lines are not lost by waiting
@@ -978,7 +1034,7 @@ struct AppStubMain {
             stubLog("run log: \(runLogPath)")
         }
 
-        // 9. Become the runtime. execv inherits environ (with the setenv
+        // 10. Become the runtime. execv inherits environ (with the setenv
         //    additions above), the pidfile fd, and the redirected fd 1 + 2.
         //
         //    "No fork, so the Dock/LS identity survives" was the assumption

@@ -450,6 +450,49 @@ public final class WindowOverlayStack {
         return OVERLAY_NONE;
     }
 
+    /** A POINTER generic event (a mouse wheel's ACTION_SCROLL, v1.0.2273) for
+     *  the window under the pointer, by the same rules as a touch DOWN
+     *  (hitTestDeliver): the top-most touchable layer containing the point gets
+     *  it in its own coordinates; outside a MODAL layer it is swallowed (the
+     *  content behind a dialog does not scroll); a non-modal layer lets it
+     *  through. @return true when an overlay took it (handled or swallowed). */
+    public static boolean deliverPointerGeneric(android.view.MotionEvent ev,
+                                                float contentX, float contentY) {
+        final List<Layer> layers = snapshot();
+        for (int i = layers.size() - 1; i >= 0; i--) {
+            Layer layer = layers.get(i);
+            View v = layer.view;
+            if (v == null || v.getVisibility() != View.VISIBLE) continue;
+            int flags = layer.params != null ? layer.params.flags : 0;
+            if ((flags & WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) != 0) continue;
+            if (layer.bounds.contains((int) contentX, (int) contentY)) {
+                final float dx = (contentX - layer.bounds.left) - ev.getX();
+                final float dy = (contentY - layer.bounds.top) - ev.getY();
+                ev.offsetLocation(dx, dy);
+                try {
+                    android.app.Dialog d = (layer.owner != null) ? layer.owner.get() : null;
+                    android.view.Window w = d != null ? d.getWindow() : null;
+                    android.view.Window.Callback cb = w != null ? w.getCallback() : null;
+                    if (cb != null) cb.dispatchGenericMotionEvent(ev);
+                    else v.dispatchGenericMotionEvent(ev);
+                } catch (Throwable t) {
+                    try { NativeLog.w("Mac.apk.Overlay", "overlay wheel threw: " + t); } catch (Throwable ig) { }
+                } finally {
+                    ev.offsetLocation(-dx, -dy);
+                }
+                sDirty = true;
+                return true;
+            }
+            final boolean nonModal = NOT_FOCUSABLE_IS_NOT_MODAL
+                ? (flags & (WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)) != 0
+                : (flags & WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL) != 0;
+            if (nonModal) continue;
+            return true;
+        }
+        return false;
+    }
+
     public static int deliverKeyResult(android.view.KeyEvent ev) {
         List<Layer> layers = snapshot();
         for (int i = layers.size() - 1; i >= 0; i--) {

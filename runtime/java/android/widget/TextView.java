@@ -567,8 +567,10 @@ public class TextView extends View
                 // `android:textColor="?about_text_primary"` does not resolve:
                 // white text turned black. An explicit @empty (DATA_NULL_EMPTY)
                 // is a real value and still goes through.
-                android.util.TypedValue rec = appearance.peekValue(attr);
-                if (rec != null && rec.type == android.util.TypedValue.TYPE_NULL
+                // macapkPeekRecord, not peekValue: peekValue is null for every
+                // TYPE_NULL slot (AOSP), and this test needs the @empty data.
+                android.util.TypedValue rec = appearance.macapkPeekRecord(attr);
+                if (rec.type == android.util.TypedValue.TYPE_NULL
                         && rec.data != 1 /* TypedValue.DATA_NULL_EMPTY */) {
                     continue;
                 }
@@ -1063,7 +1065,23 @@ public class TextView extends View
      *  password back: the screen shows dots, getText() hands over the real
      *  characters. Do not "fix" this to return the displayed text. */
     public CharSequence getText() { return text; }
+    static final boolean MACAPK_TEXT_WATCHER_EDITABLE =
+        !"0".equals(System.getenv("MACAPK_TEXT_WATCHER_EDITABLE"));
+    /** AOSP TextView.setText(CharSequence) (android14, `final`): `setText(text,
+     *  mBufferType)`. Every setText reaches the 2-arg overload, because that is
+     *  the one subclasses override (SmartTube's MarqueeTextViewCompat mirrors its
+     *  text into an inner TextView there).
+     *
+     *  ⚠ The delegation ran the other way (the 2-arg called this one), so an app
+     *  override of setText(CharSequence, BufferType) never saw setText(text):
+     *  MarqueeTextViewCompat's inner copy stayed empty and a focused, scrolling
+     *  SmartTube card title drew nothing. */
     public void setText(CharSequence t) {
+        setText(t, mBufferType);
+    }
+    /** The last BufferType setText was called with (AOSP mBufferType). */
+    private BufferType mBufferType = BufferType.NORMAL;
+    private void macapkSetTextImpl(CharSequence t) {
         // AOSP routes EVERY programmatic setText through the TextWatcher
         // before/on/after-TextChanged notifications + requestLayout/invalidate
         // (androidx TextInputLayout/MaterialTextView floating-label/error/
@@ -1100,6 +1118,19 @@ public class TextView extends View
                 int oldLen = old != null ? old.length() : 0;
                 for (android.text.TextWatcher w : textWatchers) {
                     try { w.beforeTextChanged(old, 0, oldLen, n.length()); } catch (Throwable ignored) {}
+                }
+                // AOSP setText (:7136-7141): with listeners registered
+                // (needEditableForNotification) the buffer is made an Editable
+                // (mEditableFactory.newEditable) BEFORE it is stored, and
+                // sendAfterTextChanged((Editable) text) then always runs. We
+                // stored the caller's String and skipped afterTextChanged, so
+                // TextInputLayout -- whose label logic lives in afterTextChanged
+                // -- never collapsed its hint over programmatic text: "Title"
+                // drawn full size over the field's value (ytdlnis download
+                // sheet, issue #5, 2026-10-19). MACAPK_TEXT_WATCHER_EDITABLE=0
+                // restores the old store.
+                if (MACAPK_TEXT_WATCHER_EDITABLE && !(n instanceof android.text.Editable)) {
+                    n = android.text.Editable.Factory.getInstance().newEditable(n);
                 }
                 macapkSetTextInternal(n);
                 macapkInitializeMovement();
@@ -1498,6 +1529,22 @@ public class TextView extends View
         p.setTypeface(getTypeface());
         p.setFakeBoldText(macapkFakeBold);
         p.setTextSkewX(macapkFakeItalic ? -0.25f : 0f);
+    }
+    /** AOSP's private setRawTextSize (:4649-4661) with the unit recorded the way
+     *  the constructor records it: how android:textSize from XML reaches the
+     *  view. Mac.apk's inflater applies XML attributes after construction, and
+     *  doing that through the public setTextSize(int, float) reached app
+     *  overrides a device never calls for XML: SmartTube's
+     *  MarqueeTextViewCompat forwards setTextSize(unit, size) to its inner
+     *  TextView as setTextSize(size) (sp), so the 16sp title it had already
+     *  converted to 32 px came out as 32 sp, twice the size. */
+    public void macapkSetRawTextSize(float px, int unit) {
+        mTextSizeUnit = unit;
+        if (textSizePx != px) {
+            textSizePx = px;
+            requestLayout();
+            invalidate();
+        }
     }
     public void setTextSize(float size) { setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, size); }
     public void setTextSize(int unit, float size) {
@@ -6346,7 +6393,8 @@ public class TextView extends View
     public void setText(CharSequence t, BufferType type) {
         // AOSP setText (:7052-7054): an EDITABLE buffer creates the Editor.
         if (type == BufferType.EDITABLE) createEditorIfNeeded();
-        setText(t);
+        if (type != null) mBufferType = type;
+        macapkSetTextImpl(t);
     }
     public void setTextIsSelectable(boolean selectable) {}
     /** AOSP :8398 getPrivateImeOptions reads Editor.InputContentType.

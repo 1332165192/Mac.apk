@@ -101,6 +101,8 @@ set(MACAPK_RUNTIME_SOURCES
     src/main.cpp
     thirdparty/fishhook.c
     src/jvm_loader.cpp
+    # Keeps HotSpot's JIT write mode across libjvm's dyld calls (macOS 27 TPRO).
+    src/jit_wx_guard.cpp
     src/apk_unpacker.cpp
     # AOSP large-screen window policy (pure C++; also linked by the offline
     # gate debug/winpolicy_gate.sh) and its binary-manifest traits reader.
@@ -139,7 +141,13 @@ set(MACAPK_RUNTIME_SOURCES
     # macOS Location Services -> android.location (CoreLocation, rung 1: the
     # Mac's own fused location stack; gate MACAPK_LOCATION_HOST).
     src/location_bridge.mm
+    # The active MediaSession -> macOS Now Playing + MPRemoteCommandCenter
+    # (MediaPlayer.framework, rung 1: the Mac's own system media controls and
+    # media keys; gate MACAPK_NOW_PLAYING).
+    src/nowplaying_bridge.mm
     src/webview_bridge.mm
+    # Android App Links: the sign-in window that hands a verified link back (AppLinks.java).
+    src/applink_window.mm
     # android.content.ClipboardManager <-> the macOS general pasteboard
     # (NSPasteboard, host-first rung 1; gate MACAPK_CLIPBOARD_HOST). MRC like
     # the other .mm files; AppKit/Foundation are already linked below.
@@ -182,6 +190,10 @@ set_source_files_properties(thirdparty/stb_vorbis.c PROPERTIES
 # Per-file ARC links cleanly against the MRC .mm files; the only object that
 # crosses the boundary is a __bridge (no-transfer) NSView pointer.
 set_source_files_properties(src/webview_bridge.mm PROPERTIES
+    COMPILE_OPTIONS "-fobjc-arc")
+# applink_window.mm too: the sign-in window, its WKWebView and delegate live in
+# blocks and a set past the JNI call.
+set_source_files_properties(src/applink_window.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
 # document_picker.mm too: its panels and filter arrays are captured by blocks
 # that outlive the JNI call (dispatch_async, then the panel's completion handler).
@@ -397,6 +409,7 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework WebKit"
     "-framework GameController"
     "-framework CoreLocation"
+    "-framework MediaPlayer"
     "-framework IOKit"
 )
 

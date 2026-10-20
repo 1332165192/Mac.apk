@@ -1255,6 +1255,23 @@ public final class Boot {
         System.setProperty("java.vm.name", "Dalvik");
         System.setProperty("java.vendor", "The Android Project");
         System.setProperty("java.runtime.name", "Android Runtime");
+        // The rest of the vendor/name set libcore documents as "always provided
+        // by the Dalvik VM" (AOSP libcore ojluni java/lang/System.java,
+        // getProperties javadoc table, android14-release). Versions are left at
+        // the host's on purpose: the JDK itself parses java.specification.version.
+        // Measured on SmartTube: J2V8's PlatformDetector.OS.getName() answers
+        // "android" only when java.specification.vendor contains "android";
+        // ours said the JDK vendor, so J2V8 took the desktop "linux" path, never
+        // loaded the APK's libj2v8.so, the nsig solver had no JS engine and no
+        // video stream URL could be decoded.
+        System.setProperty("java.vendor.url", "http://www.android.com/");
+        System.setProperty("java.specification.vendor", "The Android Project");
+        System.setProperty("java.specification.name", "Dalvik Core Library");
+        System.setProperty("java.vm.vendor", "The Android Project");
+        System.setProperty("java.vm.specification.vendor", "The Android Project");
+        System.setProperty("java.vm.specification.name", "Dalvik Virtual Machine Specification");
+        // AOSP RuntimeInit.commonInit sets the default HTTP User-Agent here.
+        HttpAgent.install();
 
         if (!NativeCocoa.init()) {
             NativeLog.e(TAG, "NativeCocoa.init() failed");
@@ -1826,6 +1843,14 @@ public final class Boot {
         // creates nothing in their place. Never throws.
         SharedStorage.mapUserFolders();
         SharedStorage.ensureDefaultFolders();
+        // One shared volume for every installed app (MACAPK_SHARED_SDCARD,
+        // SharedStorage.linkSharedVolume): the shared top-level folders appear in
+        // this app's volume as links; Android/ stays the app's own. Never throws.
+        SharedStorage.linkSharedVolume();
+        // ...and ONE path for that volume in every installed app, as on a device
+        // (SharedStorage.adoptCanonicalVolume; MACAPK_STORAGE_ONE_PATH=0 skips
+        // it), so a path one app hands another names the same file. Never throws.
+        SharedStorage.adoptCanonicalVolume();
 
         // ---- 3b. AndroidKeyStore JCE provider ----
         // Real Android registers the "AndroidKeyStore" security provider in
@@ -2551,7 +2576,7 @@ public final class Boot {
         // calls inside the activity (setContentView, etc.) hop to
         // main via dispatch_async in the bridge.
         final Intent intent = new Intent(Intent.ACTION_MAIN);
-        intent.addCategory(Intent.CATEGORY_LAUNCHER);
+        intent.addCategory(manifest.launchableCategory);
         intent.setClassName(manifest.packageName, manifest.launchableActivity);
         // Generic diagnostic launch override (env-gated, OFF by default).
         // Mirrors `adb shell am start -n <pkg>/<activity> -e k v ...` so a
@@ -2668,6 +2693,10 @@ public final class Boot {
         // install-time filter registration a device's PackageManager does), off
         // the boot path; a no-op in a dev run.
         HostUrlIntake.registerAsync(manifest.packageName, manifest);
+        // Verify this app's autoVerify App Link hosts (assetlinks.json against
+        // the APK's real signing certificate), as a device's verifier does.
+        AppLinks.verifyAsync(manifest.packageName, manifest,
+                application != null ? application.getPackageManager() : null);
         // appClFinal was already captured and applied as macapk-activity's
         // context ClassLoader further up (right before step 4, so it would
         // already be in place for the Application/provider-init task too --

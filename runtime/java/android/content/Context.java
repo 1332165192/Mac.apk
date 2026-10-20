@@ -2899,6 +2899,26 @@ public abstract class Context {
         // IllegalArgumentException, not a quiet false.
         if (conn == null) throw new IllegalArgumentException("connection is null");
         if (intent == null) return false;
+        // A bind to a Service that is inside its own onCreate (it binds to
+        // itself, as a media3 MediaSessionService building a MediaController for
+        // its own SessionToken does) is a BIND_SERVICE message queued behind
+        // CREATE_SERVICE on a device, so onBind runs on the published instance
+        // after onCreate returns. Binding inline here re-entered onCreate on a
+        // second instance. The target is being created, so it resolved: true.
+        if (android.app.ServiceRegistry.isCreating(intent)) {
+            final Intent fi = intent; final int ff = flags;
+            final java.util.concurrent.Executor fe = executor; final ServiceConnection fc = conn;
+            new android.os.Handler(getMainLooper()).post(() -> macapkBindNow(fi, ff, fe, fc));
+            return true;
+        }
+        return macapkBindNow(intent, flags, executor, conn);
+    }
+
+    /** bindService's inline half: bring the Service up, onBind, record the
+     *  connection and post onServiceConnected. */
+    private boolean macapkBindNow(Intent intent, int flags,
+                                  java.util.concurrent.Executor executor,
+                                  ServiceConnection conn) {
         final android.os.IBinder binder = android.app.ServiceRegistry.bind(this, intent);
         if (binder == null) {
             // Two AOSP cases collapse to null here: the Intent names no

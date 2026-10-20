@@ -294,8 +294,19 @@ public class AutoCompleteTextView extends EditText
         if (editable != null) setSelection(editable.length());
     }
 
+    /** AOSP updateDropDownForFilter (AutoCompleteTextView.java): the drop-down
+     *  opens only `if (hasFocus() && hasWindowFocus() && mPopupCanBeUpdated)`.
+     *  Ours opened for ANY filter result, so programmatic text on an unfocused
+     *  field -- which reaches the watcher since TextView.setText sends
+     *  afterTextChanged like AOSP -- popped the list open by itself (ytdlnis's
+     *  Container exposed-dropdown, issue #5). hasWindowFocus is not required
+     *  here: our dialog windows do not all report it. MACAPK_ACTV_FOCUS_GATE=0
+     *  restores the unconditional show. */
+    static final boolean MACAPK_ACTV_FOCUS_GATE =
+        !"0".equals(System.getenv("MACAPK_ACTV_FOCUS_GATE"));
     @Override public void onFilterComplete(int count) {
-        if (count > 0 && getText().length() >= mThreshold) {
+        if (count > 0 && getText().length() >= mThreshold
+                && (!MACAPK_ACTV_FOCUS_GATE || hasFocus())) {
             showDropDown();
         } else {
             dismissDropDown();
@@ -304,9 +315,12 @@ public class AutoCompleteTextView extends EditText
 
     public android.graphics.drawable.Drawable getDropDownBackground() { return null; }
 
+    /** AOSP: `filter == false` sets mBlockCompletion around setText so the
+     *  watcher does not filter (and isPerformingCompletion() reads true). */
     public void setText(CharSequence text, boolean filter) {
-        if (filter) { setText(text); }
-        else { super.setText(text); }
+        if (filter) { setText(text); return; }
+        mBlockCompletion = true;
+        try { setText(text); } finally { mBlockCompletion = false; }
     }
 
     // ==================================================================

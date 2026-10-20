@@ -90,6 +90,12 @@ public final class Manifest {
      *  through it, exactly as AOSP does. null when the app declares none. */
     public final String appComponentFactory;
     public final String launchableActivity;
+    /** The category of the intent-filter launchableActivity was found by:
+     *  android.intent.category.LAUNCHER, or LEANBACK_LAUNCHER for an app that
+     *  declares no LAUNCHER entry at all (an Android TV-only app). Boot puts it
+     *  on the launch Intent, the way the TV launcher's
+     *  getLeanbackLaunchIntentForPackage intent carries it. */
+    public String launchableCategory = "android.intent.category.LAUNCHER";
     /** android:targetSdkVersion, defaulted the way AOSP's parser defaults it:
      *  absent attribute inside <uses-sdk> -> minSdkVersion; NO <uses-sdk> at all
      *  -> 0 (DEFAULT_TARGET_SDK_VERSION), which AOSP treats as older than every
@@ -507,6 +513,27 @@ public final class Manifest {
      *  unimplemented, documented gap -- see the filter's own header. */
     public final java.util.List<String> queriesPackages;
 
+    /** One `<queries><intent>`, as AOSP ParsingPackageUtils.parseQueries turns it
+     *  into the Intent AppsFilter matches against other apps' components
+     *  (android14-release ParsingPackageUtils.java parseQueries): at most one
+     *  action / scheme / host / type; a scheme gives data scheme://host/*, a type
+     *  with no '/' gets "/*" appended, and a type with no scheme gives the data
+     *  content://STAR/STAR. Matched with IntentFilter's WILDCARD rules
+     *  (MacApkPackageManager.macapkQueriesIntentMatches). */
+    public static final class QueriesIntent {
+        public final String action, scheme, host, type;
+        public final java.util.List<String> categories;
+        QueriesIntent(String action, java.util.List<String> categories, String scheme,
+                      String host, String type) {
+            this.action = action; this.categories = categories;
+            this.scheme = scheme; this.host = host; this.type = type;
+        }
+    }
+    /** `<queries><intent>` declarations (AppsFilterUtils.canQueryViaComponents). */
+    public java.util.List<QueriesIntent> queriesIntents = java.util.Collections.emptyList();
+    /** `<queries><provider android:authorities>`, split on ';' (matchesProviders). */
+    public java.util.Set<String> queriesProviders = java.util.Collections.emptySet();
+
     /** One `<intent-filter>`, flattened to the four dimensions AOSP's
      *  IntentFilter.match() actually consults for the intents apps send
      *  in-process: action, categories, data scheme, data MIME type.
@@ -527,6 +554,12 @@ public final class Manifest {
          *  Candy Crush) hand every push to the SDK's dead-end fallback instead
          *  of their own onMessageReceived, silently. */
         public final int priority;
+        /** `<data android:host>` values, as written (AOSP keeps "*.example.com"
+         *  wildcards; AppLinks verifies the base domain for those). */
+        public final java.util.List<String> hosts;
+        /** `android:autoVerify="true"` on the filter: the app asks the platform
+         *  to verify its http(s) hosts as App Links (AppLinks.java). */
+        public final boolean autoVerify;
         public IntentFilterEntry(java.util.List<String> a, java.util.List<String> c,
                                  java.util.List<String> s, java.util.List<String> m) {
             this(a, c, s, m, 0);
@@ -534,11 +567,18 @@ public final class Manifest {
         public IntentFilterEntry(java.util.List<String> a, java.util.List<String> c,
                                  java.util.List<String> s, java.util.List<String> m,
                                  int priority) {
+            this(a, c, s, m, priority, null, false);
+        }
+        public IntentFilterEntry(java.util.List<String> a, java.util.List<String> c,
+                                 java.util.List<String> s, java.util.List<String> m,
+                                 int priority, java.util.List<String> hosts, boolean autoVerify) {
             this.actions    = a != null ? a : java.util.Collections.emptyList();
             this.categories = c != null ? c : java.util.Collections.emptyList();
             this.schemes    = s != null ? s : java.util.Collections.emptyList();
             this.mimeTypes  = m != null ? m : java.util.Collections.emptyList();
             this.priority   = priority;
+            this.hosts      = hosts != null ? hosts : java.util.Collections.emptyList();
+            this.autoVerify = autoVerify;
         }
     }
 
@@ -1502,6 +1542,8 @@ public final class Manifest {
             new java.util.ArrayList<>();
         java.util.List<FeatureEntry> reqFeatures = new java.util.ArrayList<>();
         java.util.List<String> queriesPackages = new java.util.ArrayList<>();
+        java.util.List<QueriesIntent> queriesIntents = new java.util.ArrayList<>();
+        java.util.Set<String> queriesProviders = new java.util.LinkedHashSet<>();
         NodeList rootChildren = root.getChildNodes();
         for (int i = 0; i < rootChildren.getLength(); ++i) {
             Node n = rootChildren.item(i);
@@ -1585,6 +1627,20 @@ public final class Manifest {
                     for (int qi = 0; qi < qChildren.getLength(); ++qi) {
                         Node qn = qChildren.item(qi);
                         if (qn.getNodeType() != Node.ELEMENT_NODE) continue;
+                        if ("intent".equals(qn.getNodeName())) {
+                            QueriesIntent q = parseQueriesIntent((Element) qn);
+                            if (q != null) queriesIntents.add(q);
+                            continue;
+                        }
+                        if ("provider".equals(qn.getNodeName())) {
+                            String auth = ((Element) qn).getAttributeNS(ANDROID_NS, "authorities");
+                            if (auth != null) {
+                                for (String a : auth.split(";")) {
+                                    if (!a.isEmpty()) queriesProviders.add(a);
+                                }
+                            }
+                            continue;
+                        }
                         if (!"package".equals(qn.getNodeName())) continue;
                         String qName = ((Element) qn).getAttributeNS(ANDROID_NS, "name");
                         if (qName != null && !qName.isEmpty()) queriesPackages.add(qName);
@@ -1628,9 +1684,27 @@ public final class Manifest {
         // any app that uses the alias-as-launcher pattern (Reddit,
         // Snapchat, Discord, Signal, every app with selectable icons) is
         // rejected as "no launchable activity in manifest".
-        String launch = findLaunchable(root, pkg, "activity", false);
+        String launch = findLaunchable(root, pkg, "activity", false, CAT_LAUNCHER);
         if (launch == null) {
-            launch = findLaunchable(root, pkg, "activity-alias", true);
+            launch = findLaunchable(root, pkg, "activity-alias", true, CAT_LAUNCHER);
+        }
+        // An Android TV-only app has no LAUNCHER entry: its one way in is a
+        // MAIN + LEANBACK_LAUNCHER filter (the leanback launcher's
+        // getLeanbackLaunchIntentForPackage, ApplicationPackageManager
+        // android14). Mac.apk is the launcher the user opened the app from, so
+        // when nothing else is launchable we start that entry, with that
+        // category on the intent. It changes nothing for an app that has a
+        // LAUNCHER entry (SmartTube declares both), and the device we present
+        // stays a normal touch device: no TV ui mode, no leanback feature.
+        // Mirrored in runtime/src/apk_unpacker.cpp and window_traits.cpp so the
+        // first window takes this activity's orientation and traits.
+        String launchCategory = CAT_LAUNCHER;
+        if (launch == null) {
+            launch = findLaunchable(root, pkg, "activity", false, CAT_LEANBACK_LAUNCHER);
+            if (launch == null) {
+                launch = findLaunchable(root, pkg, "activity-alias", true, CAT_LEANBACK_LAUNCHER);
+            }
+            if (launch != null) launchCategory = CAT_LEANBACK_LAUNCHER;
         }
 
         NativeLog.i(TAG, "package=" + pkg
@@ -1680,10 +1754,60 @@ public final class Manifest {
                             resizeableActivity, maxAspectRatio,
                             applicationEnabled,
                             componentProcesses, queriesPackages);
+        built.queriesIntents = queriesIntents;
+        built.launchableCategory = launchCategory;
+        built.queriesProviders = queriesProviders;
         built.applicationIconRaw = appIconRaw;
         built.requestLegacyExternalStorageRaw = requestLegacyRaw;
         built.preserveLegacyExternalStorageRaw = preserveLegacyRaw;
         return built;
+    }
+
+    /** One `<queries><intent>` as ParsingPackageUtils.parseQueries builds it, or
+     *  null where AOSP rejects it (no action and no data; more than one action,
+     *  type, scheme or host). AOSP fails the whole package parse there; an
+     *  installed app never has one, so skipping it is the same answer. */
+    private static QueriesIntent parseQueriesIntent(Element intent) {
+        java.util.List<String> actions = new java.util.ArrayList<>();
+        java.util.List<String> cats = new java.util.ArrayList<>();
+        java.util.List<String> schemes = new java.util.ArrayList<>();
+        java.util.List<String> hosts = new java.util.ArrayList<>();
+        java.util.List<String> types = new java.util.ArrayList<>();
+        NodeList kids = intent.getChildNodes();
+        for (int i = 0; i < kids.getLength(); ++i) {
+            Node k = kids.item(i);
+            if (k.getNodeType() != Node.ELEMENT_NODE) continue;
+            Element ke = (Element) k;
+            String n = ke.getAttributeNS(ANDROID_NS, "name");
+            switch (k.getNodeName()) {
+                case "action":   if (n != null && !n.isEmpty()) actions.add(n); break;
+                case "category": if (n != null && !n.isEmpty()) cats.add(n); break;
+                case "data": {
+                    String sc = ke.getAttributeNS(ANDROID_NS, "scheme");
+                    String ho = ke.getAttributeNS(ANDROID_NS, "host");
+                    String mt = ke.getAttributeNS(ANDROID_NS, "mimeType");
+                    if (sc != null && !sc.isEmpty() && !schemes.contains(sc)) schemes.add(sc);
+                    if (ho != null && !ho.isEmpty() && !hosts.contains(ho)) hosts.add(ho);
+                    if (mt != null && !mt.isEmpty() && !types.contains(mt)) types.add(mt);
+                    break;
+                }
+                default: break;
+            }
+        }
+        if (schemes.isEmpty() && types.isEmpty() && actions.isEmpty()) return null;
+        if (actions.size() > 1 || types.size() > 1 || schemes.size() > 1 || hosts.size() > 1) {
+            return null;
+        }
+        String scheme = schemes.isEmpty() ? null : schemes.get(0);
+        String host = hosts.isEmpty() ? null : hosts.get(0);
+        String type = types.isEmpty() ? null : types.get(0);
+        if (type != null && !type.contains("/")) type = type + "/*";
+        if (type != null && scheme == null) {
+            scheme = "content";
+            host = "*";
+        }
+        return new QueriesIntent(actions.isEmpty() ? null : actions.get(0), cats, scheme,
+                host, type);
     }
 
     /** Parse one `<activity>` / `<activity-alias>` / `<receiver>` element.
@@ -1775,6 +1899,7 @@ public final class Manifest {
         java.util.List<String> cats    = new java.util.ArrayList<>();
         java.util.List<String> schemes = new java.util.ArrayList<>();
         java.util.List<String> mimes   = new java.util.ArrayList<>();
+        java.util.List<String> hosts   = new java.util.ArrayList<>();
         NodeList kids = f.getChildNodes();
         for (int i = 0; i < kids.getLength(); ++i) {
             Node n = kids.item(i);
@@ -1791,6 +1916,8 @@ public final class Manifest {
                     if (s != null && !s.isEmpty()) schemes.add(s);
                     String m = e.getAttributeNS(ANDROID_NS, "mimeType");
                     if (m != null && !m.isEmpty()) mimes.add(m);
+                    String h = e.getAttributeNS(ANDROID_NS, "host");
+                    if (h != null && !h.isEmpty()) hosts.add(h);
                     break;
                 }
                 default: break;
@@ -1804,7 +1931,8 @@ public final class Manifest {
         // priority 0 -- which silently TIES firebase's -500 fallback with the
         // app's real handler and makes the whole ranking inert.
         int prio = attrInt(f, "priority", 0);
-        return new IntentFilterEntry(actions, cats, schemes, mimes, prio);
+        boolean autoVerify = "true".equalsIgnoreCase(f.getAttributeNS(ANDROID_NS, "autoVerify"));
+        return new IntentFilterEntry(actions, cats, schemes, mimes, prio, hosts, autoVerify);
     }
 
     /** An android:-namespaced attribute, or null when absent/empty. */
@@ -2024,7 +2152,8 @@ public final class Manifest {
     /** v1.0.127: shared component-walker for <activity> and
      *  <activity-alias>. Returns the fully-qualified class name of the
      *  first enabled component whose intent-filter declares both action
-     *  MAIN and category LAUNCHER, or null if none is found.
+     *  MAIN and `category` (LAUNCHER, or LEANBACK_LAUNCHER for the TV-only
+     *  fallback), or null if none is found.
      *
      *  For <activity-alias>, the launchable target is the value of
      *  `android:targetActivity` (the alias's `android:name` is its own
@@ -2037,8 +2166,12 @@ public final class Manifest {
      *
      *  Names are normalised: a leading `.` is replaced by the package
      *  prefix; a bare class name (no dots) is also packaged. */
+    private static final String CAT_LAUNCHER = "android.intent.category.LAUNCHER";
+    private static final String CAT_LEANBACK_LAUNCHER = "android.intent.category.LEANBACK_LAUNCHER";
+
     private static String findLaunchable(Element root, String pkg,
-                                          String tagName, boolean useTarget) {
+                                          String tagName, boolean useTarget,
+                                          String category) {
         NodeList components = root.getElementsByTagName(tagName);
         for (int i = 0; i < components.getLength(); ++i) {
             Element comp = (Element) components.item(i);
@@ -2078,7 +2211,7 @@ public final class Manifest {
                     if ("action".equals(t)
                         && "android.intent.action.MAIN".equals(name)) hasMain = true;
                     else if ("category".equals(t)
-                        && "android.intent.category.LAUNCHER".equals(name)) hasLauncher = true;
+                        && category.equals(name)) hasLauncher = true;
                 }
                 if (hasMain && hasLauncher) {
                     if (target.startsWith(".")) target = pkg + target;

@@ -330,8 +330,35 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                 if (mw >= 0) setMinimumWidth(mw);
                 if (mh >= 0) setMinimumHeight(mh);
             } catch (Throwable ignored) {}
+            // AOSP's View constructor reads R.styleable.View_elevation from the
+            // same four-tier cascade (android14 View.java, `case
+            // R.styleable.View_elevation: elevation = a.getDimension(...)` ->
+            // setElevation), so a widget whose DEFAULT STYLE declares
+            // android:elevation sits above its siblings. Ours read it only from
+            // the element / style= tiers in the inflater. Measured: Material3
+            // SearchView (Widget.Material3.SearchView, android:elevation
+            // m3_searchview_elevation) is the FIRST child of ytdlnis's
+            // CoordinatorLayout; at Z 0 the app bar and the result list drew
+            // over the open search page (issue #5, 2026-10-19). Separate read so
+            // the slot indexes above stay put. The inflater applies an element
+            // android:elevation afterwards, which still wins.
+            // MACAPK_VIEW_CTOR_ELEVATION=0 restores the old constructor.
+            if (MACAPK_VIEW_CTOR_ELEVATION) {
+                try {
+                    android.content.res.TypedArray ea = context.obtainStyledAttributes(
+                        attrs, CTOR_ELEVATION_ATTR, defStyleAttr, defStyleRes);
+                    if (ea.hasValue(0)) {
+                        float ev = ea.getDimension(0, 0f);
+                        if (ev != 0f && getElevation() == 0f) setElevation(ev);
+                    }
+                    ea.recycle();
+                } catch (Throwable ignored) {}
+            }
         }
     }
+    static final boolean MACAPK_VIEW_CTOR_ELEVATION =
+        !"0".equals(System.getenv("MACAPK_VIEW_CTOR_ELEVATION"));
+    private static final int[] CTOR_ELEVATION_ATTR = { 0x01010440 /*elevation*/ };
 
     // ------------------------------------------------------------------
     // Cluster B3 (widget-fidelity, 2026-09-26): CONSTRUCTOR-TIER PADDING.
@@ -1717,9 +1744,27 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         // never re-selects its unfocused art once focus leaves.
         refreshDrawableState();
         invalidate();
-        if (mInClearFocus) return;
+        // AOSP clearFocus: refocus = sAlwaysAssignFocus || !isInTouchMode(), so in
+        // touch mode a modern app's cleared focus STAYS cleared. Gated now that
+        // ViewGroup.requestFocus descends: refocusing the root unconditionally
+        // would hand focus straight back to the first focusableInTouchMode view
+        // (often the very EditText the app just cleared to hide the keyboard).
+        if (mInClearFocus || !(macapkAlwaysAssignFocus() || !isInTouchMode())) return;
         mInClearFocus = true;
         try { rootViewRequestFocus(); } catch (Throwable ignored) {} finally { mInClearFocus = false; }
+    }
+    /** AOSP View.sAlwaysAssignFocus = targetSdkVersion < P (View's constructor,
+     *  android14 :5546). An unresolved targetSdk reads as modern. */
+    private boolean macapkAlwaysAssignFocus() {
+        try {
+            android.content.Context c = getContext();
+            android.content.pm.ApplicationInfo ai = c == null ? null : c.getApplicationInfo();
+            int t = ai == null ? 0 : ai.targetSdkVersion;
+            return android.app.Application.macapkTargetSdkKnown(t)
+                && t < android.os.Build.VERSION_CODES.P;
+        } catch (Throwable t) {
+            return false;
+        }
     }
     /** AOSP rootViewRequestFocus():7968. */
     boolean rootViewRequestFocus() {
@@ -2790,7 +2835,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     // v1.0.98: more API surface used by Compose / SwipeRefreshLayout
     // / RecyclerView during init. Other isXxx/getXxx defined earlier
     // in the file are not duplicated here.
-    public boolean isInTouchMode() { return true; }
+    /** AOSP View.isInTouchMode (android14): mAttachInfo.mInTouchMode for an
+     *  attached view, config_defaultInTouchMode (true on a touch device) for a
+     *  detached one. It was a constant true; see ViewRootImpl's TOUCH MODE. */
+    public boolean isInTouchMode() {
+        return !macapkAttached || ViewRootImpl.macapkInTouchMode();
+    }
     /** AOSP View.hasWindowFocus (android11-release View.java:14620-14622):
      *      return mAttachInfo != null && mAttachInfo.mHasWindowFocus;
      *  A DETACHED view has no attach info and therefore no window focus --
@@ -3829,7 +3879,13 @@ public class View implements android.graphics.drawable.Drawable.Callback,
 
     private float transitionAlpha = 1f;
     public float getTransitionAlpha() { return transitionAlpha; }
-    public void  setTransitionAlpha(float alpha) { this.transitionAlpha = alpha; }
+    /** AOSP setTransitionAlpha: stores the multiplier and invalidates the view
+     *  (invalidateViewProperty), so a Fade's frames repaint. */
+    public void  setTransitionAlpha(float alpha) {
+        if (this.transitionAlpha == alpha) return;
+        this.transitionAlpha = alpha;
+        invalidate();
+    }
     public void  setTransitionVisibility(int visibility) {}
 
     public android.view.WindowId getWindowId() { return null; }
@@ -6081,6 +6137,11 @@ public class View implements android.graphics.drawable.Drawable.Callback,
             }
             return false;
         }
+        // AOSP requestFocusNoSearch (android14): "need to not have any parents
+        // blocking us". Matters once ViewGroup.requestFocus descends: a
+        // FOCUS_BLOCK_DESCENDANTS ancestor (a hidden leanback headers panel, a
+        // disabled pane) must keep its subtree out of focus.
+        if (hasAncestorThatBlocksDescendantFocus()) return false;
         if (mIsFocused) return true;
         handleFocusGainInternal(direction, previouslyFocusedRect);
         if (sTraceIme) {
@@ -6088,6 +6149,21 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                 + " parent=" + (getParent() == null ? "null" : getParent().getClass().getName()));
         }
         return true;
+    }
+    /** AOSP View.hasAncestorThatBlocksDescendantFocus (android14): a
+     *  FOCUS_BLOCK_DESCENDANTS ancestor, or (for a view that is not focusable
+     *  in touch mode) an ancestor whose touchscreenBlocksFocus applies. */
+    private boolean hasAncestorThatBlocksDescendantFocus() {
+        final boolean inTouchModeFocusable = isFocusableInTouchMode();
+        ViewParent ancestor = parent;
+        while (ancestor instanceof ViewGroup vg) {
+            if (vg.getDescendantFocusability() == ViewGroup.FOCUS_BLOCK_DESCENDANTS
+                    || (!inTouchModeFocusable && vg.shouldBlockFocusForTouchscreen())) {
+                return true;
+            }
+            ancestor = vg.getParent();
+        }
+        return false;
     }
     /** AOSP splits this into canTakeFocus():16018 (visible AND focusable AND
      *  ENABLED) plus the touch-mode test in requestFocusNoSearch:13304. The
@@ -6100,8 +6176,18 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         return focusable && visibility == VISIBLE && isEnabled()
             && (!isInTouchMode() || focusableInTouchMode);
     }
+    /** MACAPK_TRACE_FOCUS=1: who takes focus, from where (diagnostic). */
+    static final boolean sTraceFocus = "1".equals(System.getenv("MACAPK_TRACE_FOCUS"));
     void handleFocusGainInternal(int direction, android.graphics.Rect previouslyFocusedRect) {
         if (mIsFocused) return;
+        if (sTraceFocus) {
+            StringBuilder sb = new StringBuilder("focus-gain ").append(getClass().getName())
+                .append('@').append(Integer.toHexString(System.identityHashCode(this)))
+                .append(" dir=").append(direction);
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            for (int i = 1; i < Math.min(st.length, 14); i++) sb.append("\n      at ").append(st[i]);
+            com.macapk.loader.NativeLog.i("Mac.apk.Focus", sb.toString());
+        }
         mIsFocused = true;
         ViewParent p = getParent();
         if (p != null) p.requestChildFocus(this, this);   // builds the mFocused chain to root, clears old branch
@@ -7118,8 +7204,54 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                 return false;
         }
     }
-    @Override public boolean onKeyDown(int keyCode, KeyEvent ev) { return false; }
-    @Override public boolean onKeyUp(int keyCode, KeyEvent ev)   { return false; }
+    /** AOSP View.onKeyDown (android14 :16334-16363): a confirm key (D-pad
+     *  centre, Enter, Space, numpad Enter) on an enabled clickable or
+     *  long-clickable view presses it at its centre and arms the long-press
+     *  timer; a disabled view swallows the key.
+     *
+     *  ⚠ Both bodies were `return false` (on the belief that AOSP's are), so a
+     *  focused Button, card or row never clicked from the keyboard: Enter on a
+     *  focused SmartTube video card went nowhere. */
+    @Override public boolean onKeyDown(int keyCode, KeyEvent ev) {
+        if (KeyEvent.isConfirmKey(keyCode) && ev != null && ev.hasNoModifiers()) {
+            if (!isEnabled()) return true;
+            if (ev.getRepeatCount() == 0 && (isClickable() || isLongClickable())) {
+                if (isClickable()) setPressed(true);
+                mKeyHasPerformedLongPress = false;
+                if (isLongClickable()) {
+                    if (mKeyLongPress == null) {
+                        mKeyLongPress = () -> {
+                            if (isPressed() || !isClickable()) {
+                                if (performLongClick()) mKeyHasPerformedLongPress = true;
+                            }
+                        };
+                    }
+                    removeCallbacks(mKeyLongPress);
+                    postDelayed(mKeyLongPress, ViewConfiguration.getLongPressTimeout());
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+    /** AOSP View.onKeyUp (android14 :16392-16410): releasing a confirm key on a
+     *  pressed clickable view clicks it, unless the long press already fired or
+     *  the key was cancelled. */
+    @Override public boolean onKeyUp(int keyCode, KeyEvent ev) {
+        if (KeyEvent.isConfirmKey(keyCode) && ev != null && ev.hasNoModifiers()) {
+            if (!isEnabled()) return true;
+            if (isClickable() && isPressed()) {
+                setPressed(false);
+                if (!mKeyHasPerformedLongPress) {
+                    if (mKeyLongPress != null) removeCallbacks(mKeyLongPress);
+                    if (!ev.isCanceled()) return performClick();
+                }
+            }
+        }
+        return false;
+    }
+    private Runnable mKeyLongPress;
+    private boolean mKeyHasPerformedLongPress;
     /** KeyEvent.Callback. AOSP's View base bodies both return false; subclasses
      *  (and apps that route their own key events) override. */
     @Override public boolean onKeyMultiple(int keyCode, int repeatCount, KeyEvent ev) { return false; }

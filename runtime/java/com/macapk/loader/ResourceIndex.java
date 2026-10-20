@@ -3870,6 +3870,49 @@ public final class ResourceIndex {
      *  arrange), rendered from the compiled XML in apktool's text form. The
      *  decoded-tree walk (`matchingValueDirs("color")`) is gone with the
      *  tree. */
+    /** The DEFAULT row of a res/color selector file when that row is a theme
+     *  attribute: {"?attr", alphaOrNull}, else null. AOSP ColorStateList
+     *  inflates against a Theme and its default colour is the first row, or a
+     *  later stateless one (ColorStateList.inflate: `if (listSize == 0 ||
+     *  stateSpec.length == 0) defaultColor = color`). colorFromSelectorFile has
+     *  no Theme and skips `?` rows, so a selector whose default row is a theme
+     *  attribute resolved to nothing; Resources.Theme uses this to chase that
+     *  row in its OWN cascade. Picks the default row by colorFromSelectorFile's
+     *  rule over ALL rows, and answers only when the winner is a `?` row. */
+    public String[] macapkSelectorDefaultAttrRow(String name) {
+        if (name == null || name.isEmpty()) return null;
+        Integer fid = nameToId.get("color/" + name);
+        byte[] rowBytes = fid != null ? macapkReadFileRow(fid) : null;
+        if (rowBytes == null) return null;
+        try {
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            org.w3c.dom.Document doc = dbf.newDocumentBuilder()
+                .parse(new java.io.ByteArrayInputStream(rowBytes));
+            NodeList items = doc.getElementsByTagName("item");
+            String[] chosen = null;
+            for (int i = 0; i < items.getLength(); ++i) {
+                Element e = (Element) items.item(i);
+                String colorAttr = e.getAttribute("android:color");
+                if (colorAttr == null || colorAttr.trim().isEmpty()) continue;
+                boolean hasState = false;
+                org.w3c.dom.NamedNodeMap at = e.getAttributes();
+                for (int j = 0; at != null && j < at.getLength(); ++j) {
+                    if (at.item(j).getNodeName().contains("state_")) { hasState = true; break; }
+                }
+                if (chosen == null || !hasState) {
+                    String alpha = e.getAttribute("android:alpha");
+                    if (alpha != null && alpha.trim().startsWith("@dimen/"))
+                        alpha = getDimenRaw(alpha.trim().substring(7));
+                    chosen = new String[]{ colorAttr.trim(),
+                        alpha == null || alpha.trim().isEmpty() ? null : alpha.trim() };
+                }
+            }
+            return chosen != null && chosen[0].startsWith("?") ? chosen : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private Integer colorFromSelectorFile(String name, java.util.Set<String> visited) {
         if (name == null || name.isEmpty()) return null;
         // Shared cycle guard with resolveColorRef: a selector row pointing back at

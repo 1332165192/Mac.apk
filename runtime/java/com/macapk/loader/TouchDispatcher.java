@@ -1391,6 +1391,7 @@ public final class TouchDispatcher {
         // magnify body a real trackpad runs, entered below the NSEvent decode.
         if (v.equals("trackpad") && n >= 3) return fractionsInRange(p, 2) ? "trackpad" : "reject";
         if (v.equals("magnify") && n >= 5) return fractionsInRange(p, 2) ? "magnify" : "reject";
+        if (v.equals("hostwheel") && n >= 4) return fractionsInRange(p, 2) ? "hostwheel" : "reject";
         if (v.equals("close") || v.equals("quit") || v.equals("terminate")) return "quit";
         // Input-recorder events (InputRecorder; docs/input-recorder_2026-10-01.md):
         // the host entry points themselves, replayed with the recorded arguments.
@@ -1486,6 +1487,15 @@ public final class TouchDispatcher {
                 }
                 if (!NativeCocoa.debugTrackpad(0, a))
                     NativeLog.w(TAG, "inject-driver: trackpad frame found no input view");
+                break;
+            }
+            case "hostwheel": {
+                // hostwheel <fx> <fy> <dyLines> [dxLines]: one classic mouse-wheel
+                // notch through the host scrollWheel: body (CocoaDebugTrackpad kind 2).
+                float[] a = { Float.parseFloat(p[1]), Float.parseFloat(p[2]),
+                              Float.parseFloat(p[3]), p.length >= 5 ? Float.parseFloat(p[4]) : 0f };
+                if (!NativeCocoa.debugTrackpad(2, a))
+                    NativeLog.w(TAG, "inject-driver: hostwheel found no input view");
                 break;
             }
             case "magnify":
@@ -1960,7 +1970,7 @@ public final class TouchDispatcher {
                 if (copy instanceof KeyEvent ke) {
                     a.dispatchKeyEvent(ke);
                 } else if (copy instanceof MotionEvent me) {
-                    if (me.isFromSource(android.view.InputDevice.SOURCE_CLASS_POINTER)) {
+                    if (isTouchDispatch(me)) {
                         a.dispatchTouchEvent(me);
                     } else {
                         a.dispatchGenericMotionEvent(me);
@@ -2358,6 +2368,116 @@ public final class TouchDispatcher {
         noteRealInput();
     }
 
+    /** MACAPK_WHEEL_SCROLL_EVENT (default ON; =0 = every wheel notch is the
+     *  synthetic touch drag, the old path for every window). A host mouse-wheel
+     *  notch over a window whose input queue was TAKEN (NativeActivity, Unreal's
+     *  GameActivity) is delivered the way Android delivers a wheel: one
+     *  MotionEvent ACTION_SCROLL, SOURCE_MOUSE, TOOL_TYPE_MOUSE, with
+     *  AXIS_VSCROLL / AXIS_HSCROLL set (InputReader's CursorInputMapper: one
+     *  ACTION_SCROLL per wheel step, +1 = up / left), at the pointer position.
+     *  The synthetic drag cannot reach such an app: it arrives as DOWN, MOVE and
+     *  UP inside one frame, and a native app that POLLS its pointer state once
+     *  per frame (RetroArch's menu) never sees the finger down -- scrolling did
+     *  nothing. RetroArch reads exactly this event (input/drivers/android_input.c:
+     *  a SOURCE_MOUSE motion's AMotionEvent_getAxisValue(AXIS_VSCROLL) sets its
+     *  wheel up / down). Since v1.0.2273 (WheelScroll.ALL) every other window
+     *  gets the same event too, through deliverWheelToWindows, and the framework
+     *  scrollers answer it (WheelScroll.VIEWS); =0 keeps the v1.0.2254 drag for
+     *  them. A notch is never a touch, so it can never tap. Device id 0: Mac.apk
+     *  registers no mouse InputDevice (see InputManager), and 0 is AOSP's "not
+     *  from a physical device".
+     *  @return true when the notch was delivered as ACTION_SCROLL. */
+    public boolean dispatchWheel(float x, float y, float viewW, float viewH,
+                                 float vscroll, float hscroll) {
+        if (!WHEEL_SCROLL_EVENT) return false;
+        final Activity a = ActivityHost.peek();
+        if (a == null) return false;
+        final boolean taken = hasTakenInputQueue(a);
+        if (!taken && !WheelScroll.ALL) return false;
+        noteRealInput();
+        final float scale = macapkBackingScale();
+        final float px = x * scale, py = (viewH - y) * scale;
+        final MotionEvent ev = wheelEvent(px, py, vscroll, hscroll);
+        Runnable r = taken ? () -> deliverToTakenInputQueue(a, ev)
+                           : () -> deliverWheelToWindows(a, ev);
+        if (routeToLoop(a)) loopHandler().post(r); else r.run();
+        return true;
+    }
+
+    /** v1.0.2273 (WheelScroll.ALL): the window under the pointer gets the wheel
+     *  step, as InputDispatcher sends a pointer event to the touched window --
+     *  a floating window (dialog, popup) first, through WindowOverlayStack's
+     *  touch rules, else the activity, whose view tree routes it to the view
+     *  under the pointer (ViewGroup.dispatchGenericPointerEvent). An event no
+     *  view handles is dropped, as on a device; it never becomes a touch. */
+    /** MACAPK_WHEEL_TRACE=1: log where the first wheel steps went. */
+    private static final boolean WHEEL_TRACE = "1".equals(System.getenv("MACAPK_WHEEL_TRACE"));
+    private static int sWheelLogged;
+    private static void deliverWheelToWindows(Activity a, MotionEvent ev) {
+        try {
+            if (!WindowOverlayStack.isEmpty()) {
+                // Overlay bounds are content-space (screen minus the status bar).
+                final float contentY = ev.getY() - StatusBarDriver.heightPx(null);
+                if (WindowOverlayStack.deliverPointerGeneric(ev, ev.getX(), contentY)) {
+                    if (WHEEL_TRACE && sWheelLogged++ < 6) NativeLog.i(TAG, "wheel -> overlay window at ("
+                            + ev.getX() + "," + contentY + ")");
+                    return;
+                }
+            }
+            final boolean handled = a.dispatchGenericMotionEvent(ev);
+            if (WHEEL_TRACE && sWheelLogged++ < 6) NativeLog.i(TAG, "wheel ACTION_SCROLL v="
+                    + ev.getAxisValue(MotionEvent.AXIS_VSCROLL) + " at (" + ev.getX() + ","
+                    + ev.getY() + ") -> " + a.getClass().getSimpleName() + " handled=" + handled);
+        } catch (Throwable t) {
+            NativeLog.w(TAG, "wheel delivery threw: " + t);
+        }
+    }
+
+    static final boolean WHEEL_SCROLL_EVENT =
+        !"0".equals(System.getenv("MACAPK_WHEEL_SCROLL_EVENT"));
+
+    static boolean hasTakenInputQueue(Activity a) {
+        if (a == null) return false;
+        try {
+            android.view.Window w = a.getWindow();
+            android.view.InputQueue q = w != null ? w.macapkTakenInputQueue() : null;
+            return q != null && q.getNativePtr() != 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** ViewRootImpl.processPointerEvent sends only touch actions to
+     *  dispatchTouchEvent; a pointer HOVER or SCROLL is a generic motion
+     *  (processGenericMotionEvent / dispatchGenericMotionEvent), as is anything
+     *  not from a pointer source. */
+    static boolean isTouchDispatch(MotionEvent me) {
+        final int act = me.getActionMasked();
+        final boolean generic = act == MotionEvent.ACTION_SCROLL
+                || act == MotionEvent.ACTION_HOVER_MOVE
+                || act == MotionEvent.ACTION_HOVER_ENTER
+                || act == MotionEvent.ACTION_HOVER_EXIT;
+        return me.isFromSource(android.view.InputDevice.SOURCE_CLASS_POINTER) && !generic;
+    }
+
+    /** One wheel step as InputReader's CursorInputMapper emits it. */
+    static MotionEvent wheelEvent(float px, float py, float vscroll, float hscroll) {
+        long now = android.os.SystemClock.uptimeMillis();
+        MotionEvent.PointerProperties p = new MotionEvent.PointerProperties();
+        p.id = 0;
+        p.toolType = MotionEvent.TOOL_TYPE_MOUSE;
+        MotionEvent.PointerCoords c = new MotionEvent.PointerCoords();
+        c.x = px; c.y = py;
+        c.setAxisValue(MotionEvent.AXIS_VSCROLL, vscroll);
+        c.setAxisValue(MotionEvent.AXIS_HSCROLL, hscroll);
+        return MotionEvent.obtain(now, now, MotionEvent.ACTION_SCROLL, 1,
+                new MotionEvent.PointerProperties[]{ p },
+                new MotionEvent.PointerCoords[]{ c },
+                0 /* metaState */, 0 /* buttonState */, 1f, 1f,
+                0 /* deviceId: no mouse InputDevice is registered */, 0 /* edgeFlags */,
+                android.view.InputDevice.SOURCE_MOUSE, 0 /* flags */);
+    }
+
     public void dispatch(int action, float x, float y, float viewW, float viewH) {
         noteRealInput();
         if (TRACKPAD_MULTITOUCH) {
@@ -2403,6 +2523,9 @@ public final class TouchDispatcher {
                     (active.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(active)))));
         }
         if (active == null) return;
+        // AOSP processPointerEvent: a touch DOWN enters touch mode (focus that
+        // cannot live in touch mode is dropped), before anything consumes it.
+        if (action == MotionEvent.ACTION_DOWN) macapkEnterTouchModeForPointer(active, action);
 
         // Latch the gesture clock BEFORE any of the early returns below (the
         // nav-strip back button and the overlay stack both consume events), so
@@ -2797,6 +2920,12 @@ public final class TouchDispatcher {
         KeyEvent ev = hostKeyEvent(t, action, keyCode, metaState, autoRepeat);
         if (unicodeChar != 0) ev.macapkSetUnicodeChar(unicodeChar);
         try {
+            // AOSP ViewPostImeInputStage.processKeyEvent's first step
+            // (ViewRootImpl.java android14 :6692): a navigation key in touch
+            // mode leaves it, and when that put focus somewhere the key IS the
+            // focus request and is consumed. This is what makes the first
+            // arrow press on a TV-style UI select its first item.
+            if (macapkCheckLeavingTouchModeAndConsume(active, ev)) return;
             boolean handled = dispatchKeyToFocusedWindow(active, ev);
             if (logThis) {
                 NativeLog.i(TAG, "  -> activity.dispatchKeyEvent returned " + handled);
@@ -2810,63 +2939,191 @@ public final class TouchDispatcher {
             // (ViewRootImpl.java:6045-6060). Running it on the unhandled path is
             // what keeps a field that wants its own Tab (a code editor, a game)
             // in charge -- it consumed the key, so we never look.
+            if (s_traceFocus && action == KeyEvent.ACTION_DOWN) {
+                NativeLog.i(TAG, "  focus-trace: key " + keyCode + " handled=" + handled
+                    + " focus=" + macapkFocusName(active));
+            }
             if (!handled && action == KeyEvent.ACTION_DOWN) {
                 // NOT gated on logThis: LOG_CAP (64) saturates within the first
                 // seconds of a boot, and an absent line was about to be read as
                 // "TAB never reached the guest". A rare navigation key is worth
                 // one uncapped line.
-                macapkFocusNavigate(active, keyCode, metaState, keyCode == 61);
+                macapkFocusNavigate(active, ev, keyCode == 61);
             }
         } catch (Throwable thr) {
             NativeLog.w(TAG, "dispatchKeyEvent threw: " + thr);
         }
     }
 
-    /** AOSP ViewRootImpl.performFocusNavigation, TAB only.
+    /** MACAPK_TRACE_FOCUS=1: one line per key DOWN naming the focused view
+     *  after the tree's dispatch, and one after focus navigation. Diagnostic. */
+    private static final boolean s_traceFocus = "1".equals(System.getenv("MACAPK_TRACE_FOCUS"));
+
+    /** AOSP ViewRootImpl.checkForLeavingTouchModeAndConsume (android14
+     *  :7911-7945): only in touch mode, only on DOWN, not with
+     *  FLAG_KEEP_TOUCH_MODE. A navigation key with no modifiers leaves touch
+     *  mode and is consumed when that moved focus; a typing key leaves it and
+     *  is still delivered. */
+    private static boolean macapkCheckLeavingTouchModeAndConsume(Activity a, KeyEvent ev) {
+        if (!android.view.ViewRootImpl.macapkInTouchMode()) return false;
+        int action = ev.getAction();
+        if (action != KeyEvent.ACTION_DOWN && action != KeyEvent.ACTION_MULTIPLE) return false;
+        if ((ev.getFlags() & KeyEvent.FLAG_KEEP_TOUCH_MODE) != 0) return false;
+        android.view.View root = macapkDecor(a);
+        if (ev.hasNoModifiers() && macapkIsNavigationKey(ev.getKeyCode())) {
+            boolean took = android.view.ViewRootImpl.macapkEnsureTouchMode(root, false);
+            // One uncapped line per touch-mode exit (rare: once per switch from
+            // the mouse to the keyboard). A "nothing" with 0 focusables is a
+            // window that offers no focus target, not a key-path failure.
+            int offered = -1;
+            try {
+                if (!took && root instanceof android.view.ViewGroup vg) {
+                    offered = vg.getFocusables(android.view.View.FOCUS_DOWN).size();
+                }
+            } catch (Throwable ignored) { }
+            NativeLog.i(TAG, "touch mode left on key " + ev.getKeyCode() + ": focus "
+                + (took ? "-> " + macapkFocusName(a) : "unchanged (" + macapkFocusName(a)
+                    + ", window offers " + offered + " focusable(s))"));
+            return took;
+        }
+        if (ev.getUnicodeChar() > 0) {
+            android.view.ViewRootImpl.macapkEnsureTouchMode(root, false);
+        }
+        return false;
+    }
+
+    /** AOSP ViewRootImpl.isNavigationKey (android14 :7877-7894). */
+    private static boolean macapkIsNavigationKey(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_DPAD_LEFT: case KeyEvent.KEYCODE_DPAD_RIGHT:
+            case KeyEvent.KEYCODE_DPAD_UP: case KeyEvent.KEYCODE_DPAD_DOWN:
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_PAGE_UP: case KeyEvent.KEYCODE_PAGE_DOWN:
+            case KeyEvent.KEYCODE_MOVE_HOME: case KeyEvent.KEYCODE_MOVE_END:
+            case KeyEvent.KEYCODE_TAB: case KeyEvent.KEYCODE_SPACE:
+            case KeyEvent.KEYCODE_ENTER:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** AOSP processPointerEvent (android14 :6733-6737): a DOWN or a SCROLL
+     *  from any pointer device enters touch mode. Called on the delivery path
+     *  of every host pointer event. */
+    static void macapkEnterTouchModeForPointer(Activity a, int action) {
+        if (android.view.ViewRootImpl.macapkInTouchMode()) return;
+        if (action != android.view.MotionEvent.ACTION_DOWN
+                && action != android.view.MotionEvent.ACTION_SCROLL) return;
+        android.view.ViewRootImpl.macapkEnsureTouchMode(macapkDecor(a), true);
+    }
+
+    /** The root of the tree that holds the window's keyboard focus: what
+     *  AOSP calls ViewRootImpl.mView. Activity.dispatchKeyEvent walks the
+     *  CONTENT view's tree (our content view is normally the render root and
+     *  the decor a detached stub, Activity.macapkAttachDecor), so focus has to
+     *  be searched and restored there; the decor only when it IS that tree's
+     *  top (AppCompat's sub-decor, the screen_title decor) or there is no
+     *  content yet. Using getDecorView() here searched an empty stub on every
+     *  plain Activity (measured: SmartTube, "window offers 0 focusable(s)"). */
+    private static android.view.View macapkDecor(Activity a) {
+        if (a == null) return null;
+        try {
+            android.view.View cv = a.macapkContentView();
+            if (cv != null) return cv.getRootView();
+            android.view.Window w = a.getWindow();
+            return (w == null) ? null : w.getDecorView();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String macapkFocusName(Activity a) {
+        android.view.View root = macapkDecor(a);
+        android.view.View f = (root == null) ? null : root.findFocus();
+        return f == null ? "nothing" : f.getClass().getName() + "@"
+            + Integer.toHexString(System.identityHashCode(f));
+    }
+
+    /** AOSP ViewRootImpl.performFocusNavigation (android14 :6836-6901): the
+     *  arrows and Tab move focus once the view tree declined the key.
      *
-     *  Deliberately NOT the DPAD arrows, although AOSP maps them here too: in a
-     *  text field the arrows move the CARET, and they only reach this point
-     *  because our TextView does not yet consume them -- so handling them would
-     *  yank focus out of a field mid-edit. TAB has no caret meaning, so it is
-     *  safe on its own. Arrows can follow once the editor consumes them.
+     *  SCOPED DELTA from AOSP: the arrows are NOT taken from a focused TEXT
+     *  EDITOR. AOSP's editor consumes them first (ArrowKeyMovementMethod moves
+     *  the caret and only lets the key through at the text's edge), while ours
+     *  is still a stub that consumes nothing, so taking the arrows here would
+     *  yank focus out of a field mid-edit. Tab has no caret meaning and moves
+     *  focus from anywhere. Remove the editor guard once ArrowKeyMovementMethod
+     *  is real.
      *
      *  ⚠ The whole chain under this was already present and correct and simply
      *  unreachable: `View.focusSearch(int)` returned null unconditionally until
      *  v1.0.1608. Do not add navigation cases here without checking the entry
      *  point they depend on actually resolves. */
-    private static void macapkFocusNavigate(Activity a, int keyCode, int metaState,
-                                            boolean logThis) {
-        if (keyCode != 61 /* KEYCODE_TAB */) return;
-        // META_SHIFT_ON = 0x1: Shift+Tab walks backwards, as everywhere else.
-        final int direction = ((metaState & 0x1) != 0)
-                ? android.view.View.FOCUS_BACKWARD : android.view.View.FOCUS_FORWARD;
+    private static void macapkFocusNavigate(Activity a, KeyEvent ev, boolean logThis) {
+        final int keyCode = ev.getKeyCode();
+        int direction = 0;
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+                if (ev.hasNoModifiers()) direction = android.view.View.FOCUS_LEFT;
+                break;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+                if (ev.hasNoModifiers()) direction = android.view.View.FOCUS_RIGHT;
+                break;
+            case KeyEvent.KEYCODE_DPAD_UP:
+                if (ev.hasNoModifiers()) direction = android.view.View.FOCUS_UP;
+                break;
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+                if (ev.hasNoModifiers()) direction = android.view.View.FOCUS_DOWN;
+                break;
+            case KeyEvent.KEYCODE_TAB:
+                // META_SHIFT_ON = 0x1: Shift+Tab walks backwards, as everywhere else.
+                if (ev.hasNoModifiers()) direction = android.view.View.FOCUS_FORWARD;
+                else if (ev.hasModifiers(KeyEvent.META_SHIFT_ON))
+                    direction = android.view.View.FOCUS_BACKWARD;
+                break;
+            default:
+                break;
+        }
+        if (direction == 0) return;
         try {
-            android.view.Window w = a.getWindow();
-            android.view.View root = (w == null) ? null : w.getDecorView();
+            android.view.View root = macapkDecor(a);
             if (root == null) return;
             android.view.View focused = root.findFocus();
-            android.view.View next;
-            if (focused != null) {
-                next = focused.focusSearch(direction);
-            } else if (root instanceof android.view.ViewGroup vg) {
-                // Nothing focused yet: AOSP's ViewGroup.focusSearch(null, dir)
-                // answers the first focusable in document order.
-                next = vg.focusSearch(null, direction);
-            } else {
-                next = null;
+            if (keyCode != KeyEvent.KEYCODE_TAB && focused instanceof android.widget.TextView tv
+                    && tv.onCheckIsTextEditor()) {
+                return;
             }
-            // Both witnesses are UNCAPPED on purpose (a TAB is rare, and the
-            // v1.0.1608 capped trace nearly produced a wrong verdict). The
-            // failure line also counts what the window OFFERED, because "no
-            // next focusable" has two very different causes -- a single
-            // candidate (nowhere to go) and an empty list (nothing qualifies)
-            // -- and v1.0.1608's line could not tell them apart.
+            if (focused == null) {
+                // AOSP: nothing focused -> restoreDefaultFocus.
+                boolean ok = root.restoreDefaultFocus();
+                if (logThis) NativeLog.i(TAG, "  -> focus nav: nothing focused, default focus "
+                    + (ok ? "-> " + macapkFocusName(a) : "found nothing"));
+                return;
+            }
+            android.view.View next = focused.focusSearch(direction);
             if (next != null && next != focused) {
-                boolean ok = next.requestFocus(direction);
-                NativeLog.i(TAG, "  -> TAB focus " + (ok ? "moved to " : "DECLINED by ")
+                android.graphics.Rect r = new android.graphics.Rect();
+                focused.getFocusedRect(r);
+                if (root instanceof android.view.ViewGroup vg) {
+                    try {
+                        vg.offsetDescendantRectToMyCoords(focused, r);
+                        vg.offsetRectIntoDescendantCoords(next, r);
+                    } catch (Throwable ignored) {
+                        r = null;
+                    }
+                }
+                boolean ok = next.requestFocus(direction, r);
+                // Both witnesses are UNCAPPED for Tab (rare, and the v1.0.1608
+                // capped trace nearly produced a wrong verdict).
+                if (logThis) NativeLog.i(TAG, "  -> TAB focus " + (ok ? "moved to " : "DECLINED by ")
                     + next.getClass().getName() + "@"
                     + Integer.toHexString(System.identityHashCode(next)));
-            } else {
+                if (s_traceFocus) NativeLog.i(TAG, "  focus-trace: nav dir=" + direction
+                    + " -> " + next.getClass().getName() + (ok ? " took" : " DECLINED")
+                    + " focus=" + macapkFocusName(a));
+                if (ok) return;
+            } else if (logThis) {
                 int offered = -1;
                 try {
                     if (root instanceof android.view.ViewGroup vg) {
@@ -2874,9 +3131,14 @@ public final class TouchDispatcher {
                     }
                 } catch (Throwable ignored) { }
                 NativeLog.i(TAG, "  -> TAB: no next focusable (focused="
-                    + (focused == null ? "null" : focused.getClass().getName())
-                    + ", window offered " + offered + " focusable(s))");
+                    + focused.getClass().getName() + ", window offered " + offered
+                    + " focusable(s))");
             }
+            // AOSP: give the focused view a last chance to handle the key.
+            boolean moved = root.dispatchUnhandledMove(focused, direction);
+            if (s_traceFocus) NativeLog.i(TAG, "  focus-trace: nav dir=" + direction
+                + " next=" + (next == null ? "null" : next.getClass().getName())
+                + " unhandledMove=" + moved + " focus=" + macapkFocusName(a));
         } catch (Throwable thr) {
             NativeLog.w(TAG, "focusNavigate: " + thr);
         }

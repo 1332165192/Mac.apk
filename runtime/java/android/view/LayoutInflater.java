@@ -1417,6 +1417,8 @@ public class LayoutInflater {
      *  ConstraintLayout constraints that reference the include
      *  site's id can't resolve (the inflated view has the included
      *  file's root-element id, not the include site's). */
+    static final boolean INCLUDE_SITE_STYLE_LP =
+        !"0".equals(System.getenv("MACAPK_INCLUDE_SITE_STYLE_LP"));
     private void applyIncludeOverrides(View inflated, Element includeElem, ViewGroup parent) {
         try {
             org.w3c.dom.NamedNodeMap attrs = includeElem.getAttributes();
@@ -1480,6 +1482,22 @@ public class LayoutInflater {
                 if ("layout_width".equals(n))  siteHasW = true;
                 else if ("layout_height".equals(n)) siteHasH = true;
             }
+            // The site's width/height may come from its style= rather than
+            // attributes: AOSP's generateLayoutParams(attrs) reads through
+            // obtainStyledAttributes, which honours the AttributeSet's style.
+            // Measured: AdGuard 4.14's fragment_home has
+            //   <include android:id="@id/stub" style="@style/LayoutFullWidth"
+            //            app:layout_constraintBottom_toBottomOf="parent" .../>
+            // and, read as "no size", kept the included root's constraint-less
+            // LP: the stub sat at the top, the card barrier followed it there,
+            // and the cards covered the main protection switch (issue #5,
+            // 2026-10-19). MACAPK_INCLUDE_SITE_STYLE_LP=0 restores attrs-only.
+            java.util.Map<String, String> siteStyle = java.util.Collections.emptyMap();
+            if (INCLUDE_SITE_STYLE_LP && parent != null && !(siteHasW && siteHasH)) {
+                siteStyle = new DomBackedAttributeSet(includeElem, macapkLpContext(parent)).macapkStyleItems();
+                if (siteStyle.containsKey("layout_width"))  siteHasW = true;
+                if (siteStyle.containsKey("layout_height")) siteHasH = true;
+            }
             if (parent != null && siteHasW && siteHasH) {
                 try {
                     android.util.AttributeSet siteAttrs = new DomBackedAttributeSet(includeElem, macapkLpContext(parent));
@@ -1492,6 +1510,16 @@ public class LayoutInflater {
                 }
             }
             java.util.Map<String, String> incMargins = new java.util.HashMap<>();
+            // Style-supplied layout_* first, the site's own attributes then
+            // overwrite (the same precedence the element path applies).
+            if (lp != null) {
+                for (java.util.Map.Entry<String, String> en : siteStyle.entrySet()) {
+                    String name = en.getKey();
+                    if (!name.startsWith("layout_")) continue;
+                    if (LAYOUT_AOSP_1643 && MARGIN_ATTRS.contains(name)) incMargins.put(name, en.getValue());
+                    else applyLayoutAttribute(lp, name, en.getValue());
+                }
+            }
             for (int i = 0; i < attrs.getLength(); i++) {
                 Node a = attrs.item(i);
                 String name = a.getLocalName();
@@ -2387,8 +2415,15 @@ public class LayoutInflater {
             // would re-apply the sp->px scale -> DOUBLE-sized text. Apply as PX.
             // (Bug: Calculator's DisplayLarge result rendered 228px == 57sp*2*2
             // instead of 57sp*2=114px; every style-textAppearance text was 2x.)
-            if (px != null && px > 0)
-                tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, px);
+            // Raw, as AOSP's constructor applies a textAppearance size
+            // (setRawTextSize), never through the overridable setTextSize.
+            if (px != null && px > 0) {
+                String v = sz.trim();
+                int unit = v.endsWith("sp") ? android.util.TypedValue.COMPLEX_UNIT_SP
+                    : (v.endsWith("dp") || v.endsWith("dip")) ? android.util.TypedValue.COMPLEX_UNIT_DIP
+                    : android.util.TypedValue.COMPLEX_UNIT_PX;
+                tv.macapkSetRawTextSize(px, unit);
+            }
         }
         String col = macapkStyleAttrRaw(styleName, "textColor");
         if (applyColor && col != null) {
@@ -3731,13 +3766,19 @@ public class LayoutInflater {
             //     framework table, deliberately -- see that table's note on why
             //     injecting colour here is a precedence hazard.
             final boolean editText = "editTextStyle".equals(defStyleAttr);
+            // "focusable" / "clickable": Widget.Button and Widget.CompoundButton
+            // declare both true (core/res styles.xml), and it is the STYLE that
+            // makes a platform button focusable on a device. Without them a
+            // Button could hold focus only if the app set it, so D-pad / Tab
+            // focus skipped every plain button.
             for (String attr : (compound
-                    ? new String[]{"button"}
+                    ? new String[]{"button", "focusable", "clickable"}
                     : editText
                     ? new String[]{"background", "textSize", "minHeight",
                                    "minWidth", "gravity", "textColor"}
                     : new String[]{"background", "minHeight", "minWidth",
-                                   "gravity", "textColor", "textAllCaps"})) {
+                                   "gravity", "textColor", "textAllCaps",
+                                   "focusable", "clickable"})) {
                 // `containsKey` is CORRECT here, and a v1.0.871 experiment that
                 // said otherwise was reverted. The reasoning that looked right:
                 // Material's `Widget.MaterialComponents.Button` declares
@@ -4701,8 +4742,16 @@ public class LayoutInflater {
                         Float sz = parseDimensionPx(value);
                         // parseDimensionPx already gave px; setTextSize(float) is
                         // the SP overload and would double-convert. Apply as PX.
-                        if (sz != null)
-                            tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, sz);
+                        // AOSP sets the XML size inside the constructor through the
+                        // private setRawTextSize, never through the overridable
+                        // public setTextSize; see TextView.macapkSetRawTextSize.
+                        if (sz != null) {
+                            String v = value.trim();
+                            int unit = v.endsWith("sp") ? android.util.TypedValue.COMPLEX_UNIT_SP
+                                : (v.endsWith("dp") || v.endsWith("dip")) ? android.util.TypedValue.COMPLEX_UNIT_DIP
+                                : android.util.TypedValue.COMPLEX_UNIT_PX;
+                            tv.macapkSetRawTextSize(sz, unit);
+                        }
                     }
                     return;
                 case "textStyle":
@@ -4813,6 +4862,26 @@ public class LayoutInflater {
                     // reads it from its own TypedArray; setting it again here is
                     // the same value.)
                     if (LAYOUT_AOSP_1643) setBooleanReflect(view, attr, "true".equals(value));
+                    return;
+                case "descendantFocusability":
+                    // AOSP ViewGroup's constructor: setDescendantFocusability(
+                    // DESCENDANT_FOCUSABILITY_FLAGS[a.getInt(attr, 0)]), the enum
+                    // beforeDescendants=0 / afterDescendants=1 / blocksDescendants=2
+                    // (attrs.xml). Never read, so every XML group stayed
+                    // BEFORE_DESCENDANTS: leanback's BrowseFrameLayout (focusable,
+                    // afterDescendants in lb_browse_fragment.xml) then kept focus
+                    // ITSELF instead of handing it to its rows, and a list row
+                    // that blocks descendants let its buttons steal focus.
+                    if (view instanceof ViewGroup vgDF && value != null) {
+                        int df;
+                        switch (value.trim()) {
+                            case "0": case "beforeDescendants": df = ViewGroup.FOCUS_BEFORE_DESCENDANTS; break;
+                            case "1": case "afterDescendants": df = ViewGroup.FOCUS_AFTER_DESCENDANTS; break;
+                            case "2": case "blocksDescendants": df = ViewGroup.FOCUS_BLOCK_DESCENDANTS; break;
+                            default: df = -1; break;
+                        }
+                        if (df != -1) vgDF.setDescendantFocusability(df);
+                    }
                     return;
                 case "focusable":
                 case "focusableInTouchMode":

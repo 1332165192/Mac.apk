@@ -173,6 +173,29 @@ public final class ServiceRegistry {
     private static final Map<String, Integer> sJobBindings = new ConcurrentHashMap<>();
     /** Instances ever created (onCreate run), per component. */
     private static final Map<String, Integer> sCreated = new ConcurrentHashMap<>();
+    /** Components whose onCreate is running right now (ensure() between
+     *  construction and publish). On a device a service's own onCreate cannot
+     *  be re-entered: ActivityThread runs CREATE_SERVICE, BIND_SERVICE and
+     *  SERVICE_ARGS as separate messages on the main Handler, so a bind or a
+     *  start requested FROM onCreate is queued behind it and runs once onCreate
+     *  has returned and the instance is published. Our start/bind are inline,
+     *  so without this a component that binds to itself in onCreate (media3's
+     *  MediaController.Builder(this, SessionToken(this, own service)) does)
+     *  constructed a SECOND instance and ran its onCreate inside the first. */
+    private static final java.util.Set<String> sCreating =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** MACAPK_SVC_REENTRY_DEFER=0: the pre-fix inline re-entry, for one A/B. */
+    static final boolean REENTRY_DEFER =
+        !"0".equals(System.getenv("MACAPK_SVC_REENTRY_DEFER"));
+
+    /** True when the Service this Intent names is inside its own onCreate, so
+     *  a bind or start for it must be queued behind that onCreate (see
+     *  sCreating). Context.bindService asks this before binding inline. */
+    public static boolean isCreating(Intent intent) {
+        if (!REENTRY_DEFER || sCreating.isEmpty()) return false;
+        String cls = classNameOf(intent);
+        return cls != null && sCreating.contains(cls);
+    }
 
     /** How many instances of `className` this process has created (onCreate
      *  run). Diagnostic only: an offline gate asks "did the service run?"
@@ -274,7 +297,11 @@ public final class ServiceRegistry {
         // STOP_ASYNC: a start that races its own component's queued onDestroy
         // is posted behind it, so the old instance goes before the new one
         // is created (see destroyLater).
-        if (!macapkOnMainThread() || (STOP_ASYNC && sPendingDestroy.containsKey(cls))) {
+        // A start from the component's own onCreate is queued behind it on a
+        // device (SERVICE_ARGS after CREATE_SERVICE), so onStartCommand runs on
+        // the published instance once onCreate returns (see sCreating).
+        if (!macapkOnMainThread() || (STOP_ASYNC && sPendingDestroy.containsKey(cls))
+                || (REENTRY_DEFER && sCreating.contains(cls))) {
             final Context fctx = ctx; final Intent fi = intent; final String fcls = cls;
             macapkPostToMain(() -> startNow(fctx, fi, fcls));
             return started;
@@ -469,10 +496,15 @@ public final class ServiceRegistry {
             if (base != null) {
                 try { svc.macapkAttach(base); } catch (Throwable ignored) {}
             }
+            sCreating.add(cls);
             try { svc.onCreate(); } catch (Throwable t) { log("onCreate", cls, t); }
+            finally { sCreating.remove(cls); }
             sCreated.merge(cls, 1, Integer::sum);
-            // Publish only after onCreate so a re-entrant startService
-            // during onCreate doesn't double-construct.
+            // Published only after onCreate, as ActivityThread.handleCreateService
+            // does (mServices.put follows service.onCreate()). A start or bind
+            // issued from inside onCreate is deferred by start()/isCreating()
+            // until this put has happened; this comment used to claim the late
+            // put itself prevented a double construct, and it was the cause.
             sLive.put(cls, svc);
             return svc;
         } catch (Throwable t) {

@@ -457,10 +457,33 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     // wrapping roughly every 27:03:11 at 44.1 kHz. The native side tracks full
     // 64-bit precision; this (int) narrowing reproduces AOSP's 32-bit wrap
     // exactly (low 32 bits, same as a real HAL position overflowing uint32_t).
+    /** MACAPK_AUDIO_CLOCK_TRACE=1: the playback clock as a player sees it.
+     *  offset = reported position - host time; a steady clock keeps it
+     *  constant, so its spread is the clock's jitter. kind 0 = head position,
+     *  1 = getTimestamp (plus how stale its nanoTime is). Every 200 reads. */
+    static final boolean CLOCK_TRACE = "1".equals(System.getenv("MACAPK_AUDIO_CLOCK_TRACE"));
+    private final long[][] mClk = new long[2][200]; private final long[] mStale = new long[200];
+    private final int[] mClkN = new int[2];
+    private synchronized void clockTrace(int kind, long offsetNs, long staleNs) {
+        int i = mClkN[kind]++;
+        mClk[kind][i] = offsetNs;
+        if (kind == 1) mStale[i] = staleNs;
+        if (mClkN[kind] == 200) {
+            long[] a = mClk[kind].clone(); java.util.Arrays.sort(a);
+            String extra = "";
+            if (kind == 1) { long[] b = mStale.clone(); java.util.Arrays.sort(b);
+                extra = String.format(" stale p50=%.1fms p95=%.1f max=%.1f", b[100] / 1e6, b[190] / 1e6, b[199] / 1e6); }
+            com.macapk.loader.NativeLog.i("AudioTrack", String.format("clock %s: offset spread p5..p95=%.1fms (p50-p5=%.1f, p95-p50=%.1f) max-min=%.1f%s",
+                kind == 0 ? "headPosition" : "getTimestamp", (a[190] - a[10]) / 1e6, (a[100] - a[10]) / 1e6, (a[190] - a[100]) / 1e6,
+                (a[199] - a[0]) / 1e6, extra));
+            mClkN[kind] = 0;
+        }
+    }
     public int getPlaybackHeadPosition() {
         if (handle == 0) return 0;
         int pos = (int) com.macapk.loader.NativeAudio.nativeGetPlaybackHeadPosition(handle);
         com.macapk.loader.AudioTrace.hit("AudioTrack.getPlaybackHeadPosition", "pos=" + pos);
+        if (CLOCK_TRACE && sampleRate > 0) clockTrace(0, (long) pos * 1_000_000_000L / sampleRate - System.nanoTime(), 0);
         return pos;
     }
     // AOSP's native_get_timestamp-backed poll: fills (framePosition, nanoTime)
@@ -506,6 +529,8 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         // the two sees the same wrapped value for the same instant.
         timestamp.framePosition = out[0] & 0xFFFFFFFFL;
         timestamp.nanoTime = out[1];
+        if (CLOCK_TRACE && sampleRate > 0) clockTrace(1, timestamp.framePosition * 1_000_000_000L / sampleRate - timestamp.nanoTime,
+            System.nanoTime() - timestamp.nanoTime);
         com.macapk.loader.AudioTrace.hit("AudioTrack.getTimestamp",
             "true framePosition=" + timestamp.framePosition + " nanoTime=" + timestamp.nanoTime);
         return true;

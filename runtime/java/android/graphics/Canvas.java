@@ -2552,6 +2552,33 @@ public class Canvas {
             macapkDrawStringRuns(text, x, y, primary);
             return;
         }
+        // v1.0.2239: shape the WHOLE run first, then space its glyph clusters,
+        // which is minikin's order (LayoutCore.cpp adds the gaps while walking
+        // HarfBuzz's output). Drawing grapheme by grapheme made every ligature
+        // impossible -- an icon font such as Material Symbols, whose "home" is a
+        // single rlig glyph, drew the letter H instead -- and lost kerning across
+        // clusters that measureText (one quantized vector) still charged. Same
+        // vector, same cluster rule (MacApkFont.spacingClusterOrdinals) as the
+        // measure side, so measure and draw agree by construction.
+        if (MacApkFont.SHAPED_SPACING && MacApkFont.firstSpecial(text, primary) < 0) {
+            MacApkFont.Quantized q = MacApkFont.quantize(g.getFont(), text,
+                                                         MacApkFont.ligaFor(ls));
+            int[] ord = (q == null) ? null : MacApkFont.spacingClusterOrdinals(q.glyphs, text);
+            if (ord != null) {
+                java.awt.font.GlyphVector gv = q.glyphs;
+                final int ng = gv.getNumGlyphs();
+                for (int i = 0; i <= ng; i++) {
+                    java.awt.geom.Point2D gp = gv.getGlyphPosition(i);
+                    // Glyph i sits half a gap in, plus one gap per cluster before
+                    // its own; position ng (the total advance) carries every gap.
+                    float shift = (i < ng) ? gap * (0.5f + ord[i]) : gap * ord[ng];
+                    gv.setGlyphPosition(i, new java.awt.geom.Point2D.Float(
+                        (float) gp.getX() + shift, (float) gp.getY()));
+                }
+                g.drawGlyphVector(gv, x, y);
+                return;
+            }
+        }
         // Same UAX#29 segmentation the measure side counts with -- shared, not
         // re-derived, because a disagreement here is a whole gap per cluster.
         int[] bounds = android.graphics.Paint.macapkClusterBounds(text);
@@ -4406,7 +4433,20 @@ public class Canvas {
     // gradient across ALL fill/stroke ops at once. Returns null when no faithful
     // mapping is possible (then applyPaint falls back to the solid color). Every
     // AWT constructor that can throw on degenerate geometry is guarded.
-    private java.awt.Paint awtPaintForShader(Shader shader) {
+    private java.awt.Paint awtPaintForShader(Shader shader) { return awtPaintForShader(shader, null); }
+    /** REPEAT and MIRROR tile; a TexturePaint can reproduce both. */
+    private static boolean macapkTiles(Shader.TileMode m) {
+        return m == Shader.TileMode.REPEAT || m == Shader.TileMode.MIRROR;
+    }
+    /** MACAPK_BITMAPSHADER_MATRIX (default ON; =0 = every BitmapShader is a
+     *  java.awt.TexturePaint at the bitmap's own size, the pre-v1.0.2271 path):
+     *  a BitmapShader with a local matrix, or with a CLAMP / DECAL axis, is
+     *  sampled through CTM x localMatrix with its tile modes
+     *  (MacApkBitmapShaderPaint). TexturePaint stays for REPEAT / MIRROR with no
+     *  local matrix, where it is exact. */
+    static final boolean BITMAPSHADER_MATRIX =
+        !"0".equals(System.getenv("MACAPK_BITMAPSHADER_MATRIX"));
+    private java.awt.Paint awtPaintForShader(Shader shader, Paint p) {
         try {
             AffineTransform lm = shader.macapkLocalAffine();
             if (shader instanceof LinearGradient) {
@@ -4453,6 +4493,17 @@ public class Canvas {
                 // CLAMP (edge-texel extension) and DECAL (transparent outside) still approximate --
                 // they need padding sized to the fill bounds, which is not available here; that is
                 // stated rather than silently lumped in with MIRROR.
+                if (BITMAPSHADER_MATRIX) {
+                    final boolean hasMatrix = lm != null && !lm.isIdentity();
+                    final boolean clampish = !macapkTiles(bs.tileX) || !macapkTiles(bs.tileY);
+                    if (hasMatrix || clampish) {
+                        final int fm = bs.getFilterMode();
+                        final boolean bilinear = fm == BitmapShader.FILTER_MODE_LINEAR
+                            || (fm == BitmapShader.FILTER_MODE_DEFAULT && (p == null || p.isFilterBitmap()));
+                        return new MacApkBitmapShaderPaint(img, hasMatrix ? lm : null,
+                            bs.tileX, bs.tileY, bilinear);
+                    }
+                }
                 BufferedImage tile = img;
                 boolean mx = (bs.tileX == Shader.TileMode.MIRROR);
                 boolean my = (bs.tileY == Shader.TileMode.MIRROR);
@@ -4471,7 +4522,7 @@ public class Canvas {
             if (shader instanceof ComposeShader) {
                 // Cannot truly compose two shaders on a software canvas; sample
                 // the first so the fill is approximately right rather than blank.
-                return awtPaintForShader(((ComposeShader) shader).macapkA());
+                return awtPaintForShader(((ComposeShader) shader).macapkA(), p);
             }
         } catch (Throwable t) {
             // Degenerate gradient geometry / bad fractions -> solid-color fallback.
@@ -5470,7 +5521,7 @@ public class Canvas {
             g.setColor(toAwtColor(tint));
             com.macapk.loader.GfxTrace.feature("colorFilter", cf.getClass().getSimpleName(), true);
         } else if (shader != null) {
-            java.awt.Paint sp = awtPaintForShader(shader);
+            java.awt.Paint sp = awtPaintForShader(shader, p);
             if (sp != null) {
                 shaderInstalled = true;
                 g.setPaint(sp);
