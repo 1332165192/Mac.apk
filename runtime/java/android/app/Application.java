@@ -197,15 +197,12 @@ public class Application extends ContextWrapper
         // through to when the base is null (the pre-terminator behavior), so this
         // preserves exactly what unmapped services resolved to before.
         @Override public Object getSystemService(String name) { return super.getSystemService(name); }
-        // Builder getters below forward to methods Application OVERRIDES, so each
-        // one terminates in the Application's own field-backed builder rather than
-        // coming back here. That is the whole reason they are safe, and it is a
-        // per-method property, not a general one: forwarding to a method the
-        // Application does NOT override sends the call straight back to
-        // ContextWrapper, which asks its baseContext -- this object -- again.
-        // See getContentResolver() below for the one that got that wrong.
-        @Override public android.content.pm.ApplicationInfo getApplicationInfo() { return app.getApplicationInfo(); }
-        @Override public PackageManager getPackageManager() { return app.getPackageManager(); }
+        // Reach the canonical builders without virtual dispatch: an Application
+        // subclass may override these getters and delegate back to its base.
+        // Calling app.getXxx() here would re-enter that override and recurse.
+        // Public Application getters remain overridable for app-facing calls.
+        @Override public android.content.pm.ApplicationInfo getApplicationInfo() { return app.macapkApplicationInfoReal(); }
+        @Override public PackageManager getPackageManager() { return app.macapkPackageManagerReal(); }
         // Serve from the REAL provider, NOT app.getSharedPreferences: an app that
         // overrides getSharedPreferences and delegates back to its base context
         // (Instagram) would cycle base -> app -> base and StackOverflow. Same
