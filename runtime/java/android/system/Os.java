@@ -111,20 +111,62 @@ public class Os {
     public static int getgid() { return 1000; }
     public static int getpid() { return (int) ProcessHandle.current().pid(); }
 
-    /** AOSP Os.readlink (API 21): the target path of a symlink. Mac.apk maps
-     *  this onto the host filesystem via java.nio; a non-link path resolves to
-     *  itself. */
+    /** AOSP Os.readlink (API 21): the target path of a symlink. libcore's
+     *  Linux.readlink is readlink(2) (libcore/luni/src/main/native/
+     *  libcore_io_Linux.cpp Linux_readlink: readlink(), throwing ErrnoException
+     *  "readlink" on failure), so a path that is NOT a symlink fails with EINVAL,
+     *  a missing one with ENOENT, a path through a regular file with ENOTDIR.
+     *  This used to hand back the path itself for all three, which is a
+     *  different, wrong fact: RetroArch's RetroActivityCommon.cleanupSymlinks
+     *  deletes every file in its cores dir whose readlink does not throw, so
+     *  each launch deleted every core the user had downloaded.
+     *  MACAPK_OS_READLINK_ERRNO=0 restores the old answer. */
     public static String readlink(String path) throws android.system.ErrnoException {
+        if (!READLINK_ERRNO) {
+            try {
+                java.nio.file.Path p = java.nio.file.Paths.get(path);
+                if (java.nio.file.Files.isSymbolicLink(p)) {
+                    return java.nio.file.Files.readSymbolicLink(p).toString();
+                }
+                return path;
+            } catch (Exception e) {
+                return path;
+            }
+        }
+        if (path == null) throw new NullPointerException("path == null");
+        final java.nio.file.Path p;
         try {
-            java.nio.file.Path p = java.nio.file.Paths.get(path);
+            p = java.nio.file.Paths.get(path);
+        } catch (java.nio.file.InvalidPathException e) {
+            throw new ErrnoException("readlink", OsConstants.ENOENT);
+        }
+        try {
             if (java.nio.file.Files.isSymbolicLink(p)) {
                 return java.nio.file.Files.readSymbolicLink(p).toString();
             }
-            return path;
-        } catch (Exception e) {
-            return path;
+            if (java.nio.file.Files.exists(p, LinkOption.NOFOLLOW_LINKS)) {
+                throw new ErrnoException("readlink", OsConstants.EINVAL);
+            }
+            // Missing: ENOTDIR when an existing ancestor is not a directory
+            // (path resolution fails there), otherwise ENOENT.
+            for (java.nio.file.Path a = p.getParent(); a != null; a = a.getParent()) {
+                if (java.nio.file.Files.exists(a)) {
+                    if (!java.nio.file.Files.isDirectory(a)) {
+                        throw new ErrnoException("readlink", OsConstants.ENOTDIR);
+                    }
+                    break;
+                }
+            }
+            throw new ErrnoException("readlink", OsConstants.ENOENT);
+        } catch (java.nio.file.AccessDeniedException e) {
+            throw new ErrnoException("readlink", OsConstants.EACCES);
+        } catch (IOException e) {
+            throw new ErrnoException("readlink", OsConstants.EIO);
         }
     }
+
+    private static final boolean READLINK_ERRNO =
+        !"0".equals(System.getenv("MACAPK_OS_READLINK_ERRNO"));
 
 
     // --- raw-fd operations (JNI via com.macapk.loader.NativeOs -> Darwin libc). ---

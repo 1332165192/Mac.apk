@@ -4445,7 +4445,19 @@ public class Activity extends ContextThemeWrapper
         // through Window.superDispatchGenericMotionEvent -> decor would miss it
         // and the focused view in it.
         View cv = contentView;
-        if (cv != null && cv.dispatchGenericMotionEvent(ev)) return true;
+        if (cv != null) {
+            // A pointer event (a mouse wheel's ACTION_SCROLL) is in window
+            // coordinates and the content root is entered in its own, exactly as
+            // dispatchTouchEvent above offsets a touch.
+            final boolean pointer = ev.isFromSource(android.view.InputDevice.SOURCE_CLASS_POINTER);
+            final float dx = pointer ? -cv.getLeft() : 0f;
+            final float dy = pointer ? -cv.getTop() : 0f;
+            ev.offsetLocation(dx, dy);
+            boolean handled;
+            try { handled = cv.dispatchGenericMotionEvent(ev); }
+            finally { ev.offsetLocation(-dx, -dy); }
+            if (handled) return true;
+        }
         return onGenericMotionEvent(ev);
     }
     public boolean onGenericMotionEvent(android.view.MotionEvent event) { return false; }

@@ -30118,8 +30118,12 @@ extern "C" int __macapk_arm64_pthread_cond_wait(int32_t* c, int32_t* m) {
     __macapk_arm64_pthread_mutex_lock(m);       // re-acquire before return
     return 0;
 }
-extern "C" int __macapk_arm64_pthread_cond_timedwait(int32_t* c, int32_t* m,
-                                                       const void* abstime) {
+// clock_slot: 0 = the cond's own clock (its pthread_condattr_setclock stamp,
+// c[kCondClockSlot]); otherwise the clock this call names, as clock_id + 1 (the
+// same encoding as the stamp: 1 REALTIME, 2 MONOTONIC), for
+// pthread_cond_timedwait_monotonic_np and pthread_cond_clockwait.
+static int macapk_arm64_cond_timedwait_clock(int32_t* c, int32_t* m,
+                                             const void* abstime, int clock_slot) {
     if (!c || !m) return 22;
     if (!macapk_arm64_cond_ensure_valid(c)) return 22;
     if (!macapk_arm64_mutex_ensure_valid(m)) return 22;
@@ -30145,7 +30149,8 @@ extern "C" int __macapk_arm64_pthread_cond_timedwait(int32_t* c, int32_t* m,
         // PTHREAD_COND_INITIALIZER cond, which still falls back to the
         // magnitude heuristic.
         rel = macapk_abstime_to_rel_ns(
-            abstime, __atomic_load_n(&c[kCondClockSlot], __ATOMIC_RELAXED));
+            abstime, clock_slot ? clock_slot
+                                : __atomic_load_n(&c[kCondClockSlot], __ATOMIC_RELAXED));
         // Deadline already in the past: per POSIX return ETIMEDOUT with the
         // mutex still held (we never released it).
         if (rel == 0) return 110;  // ETIMEDOUT (Bionic)
@@ -30202,6 +30207,30 @@ extern "C" int __macapk_arm64_pthread_cond_timedwait(int32_t* c, int32_t* m,
     __macapk_arm64_pthread_mutex_lock(m);
     if (r < 0) return infinite_clamped ? 0 : 110;   // -1 == deadline (errno-neutral helper)
     return 0;
+}
+extern "C" int __macapk_arm64_pthread_cond_timedwait(int32_t* c, int32_t* m,
+                                                       const void* abstime) {
+    return macapk_arm64_cond_timedwait_clock(c, m, abstime, 0);
+}
+// Bionic pthread_cond.cpp (main): pthread_cond_timedwait_monotonic_np waits against
+// CLOCK_MONOTONIC whatever the cond's attr said; pthread_cond_clockwait (API 30)
+// switches on the clock: CLOCK_MONOTONIC -> timedwait_monotonic_np,
+// CLOCK_REALTIME -> the realtime wait, anything else EINVAL. Bionic clock ids:
+// CLOCK_REALTIME 0, CLOCK_MONOTONIC 1 (Linux uapi/linux/time.h; macOS's own
+// CLOCK_MONOTONIC is 6, so the guest's value is never handed to libSystem).
+// MEASURED need: iiSU's libdiscord_jni.so imports pthread_cond_clockwait
+// ("unresolved external 'pthread_cond_clockwait'"), which bound to the panic stub.
+extern "C" int __macapk_arm64_pthread_cond_timedwait_monotonic_np(int32_t* c, int32_t* m,
+                                                                  const void* abstime) {
+    return macapk_arm64_cond_timedwait_clock(c, m, abstime, 2);
+}
+extern "C" int __macapk_arm64_pthread_cond_clockwait(int32_t* c, int32_t* m, int clock,
+                                                     const void* abstime) {
+    switch (clock) {
+        case 1: return macapk_arm64_cond_timedwait_clock(c, m, abstime, 2);   // MONOTONIC
+        case 0: return macapk_arm64_cond_timedwait_clock(c, m, abstime, 1);   // REALTIME
+        default: return 22;                                                   // EINVAL
+    }
 }
 
 // Bionic pthread_rwlock_t is 56 bytes (LP64: `int32_t __private[14]`,
@@ -35728,6 +35757,8 @@ extern "C" int __macapk_arm64_dladdr(const void* addr, Dl_info* info) {
 extern "C" int __macapk_elfexec_guest_dlopen(const char* path, int bionic_flag, void** out);
 extern "C" int __macapk_elfexec_guest_dlsym(void* handle, const char* name, void** out);
 extern "C" int __macapk_elfexec_guest_dlclose(void* handle);
+extern "C" int __macapk_runtime_guest_dlopen(const char* path, int bionic_flag, void** out);
+static std::string macapk_arm64_remap_path(const char* p);
 static void macapk_note_wrapper_handle(void* h, const std::string& dylib_path);  // MACAPK_WRAPPER_DATA_DLSYM
 extern "C" void* __macapk_arm64_dlopen(const char* path, int flag) {
     // Stage-6 guests are LP64.
@@ -35907,6 +35938,15 @@ extern "C" void* __macapk_arm64_dlopen(const char* path, int flag) {
         // loader, never host dyld (bionic_shim_elfexec.cpp). A no-op in the runtime process.
         void* elf_handle = nullptr;
         if (__macapk_elfexec_guest_dlopen(path, flag, &elf_handle)) return elf_handle;
+        // In the runtime process, a request that names a file holding an arm64 ELF the
+        // cases above did not claim (one the app downloaded or unpacked itself, e.g. a
+        // libretro core) is loaded by the Stage-6 loader rather than sent to dyld, which
+        // cannot load it (bionic_shim_elfexec.cpp, MACAPK_RUNTIME_ELF_DLOPEN).
+        if (std::strchr(path, '/') != nullptr) {
+            const std::string host_path = macapk_arm64_remap_path(path);
+            if (__macapk_runtime_guest_dlopen(host_path.c_str(), flag, &elf_handle))
+                return elf_handle;
+        }
     }
     return dlopen(path, mac_flag);
 }
@@ -36947,6 +36987,44 @@ static void macapk_swap_trace_add(MacapkSwapTraceBatch* b, double dur_s, double 
 }
 static thread_local double t_swap_trace_entry = 0.0;
 
+// Java EGL14 windows reached through the NATIVE libEGL (GitHub #16). An app may
+// create a window with EGL14.eglCreateWindowSurface on a SurfaceTexture and hand
+// the handles to C++ that makes it current and swaps it here (MapLibre Native's
+// Android GL backend, Rive). That window is a pbuffer the runtime reads back and
+// queues into the SurfaceTexture at each swap (runtime/src/egl14_bridges.inc,
+// "EGL14 window surfaces"), and only its Java eglSwapBuffers did so: on a device
+// both APIs are one libEGL, so a native swap presents the same frame. The
+// runtime exports the two halves; resolved once, null in a process without them
+// (the swap is then the plain forward it always was):
+//   int   __macapk_egl14_window_swap(dpy, surf)    -1 not an EGL14 window, else
+//                                                  the readback + queue ran
+//   void* __macapk_egl14_window_resolve(dpy, surf) the pbuffer now behind the
+//                                                  app's handle (a resize replaces
+//                                                  it); any other surface as is
+// BISECT GATE: MACAPK_EGL14_NATIVE_WINDOW=0 skips both lookups, so the native
+// swap / make-current / query are the plain ANGLE forwards they were before.
+using MacapkEgl14SwapFn = int (*)(void*, void*);
+using MacapkEgl14ResolveFn = void* (*)(void*, void*);
+static bool macapk_egl14_native_window_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("MACAPK_EGL14_NATIVE_WINDOW");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+static MacapkEgl14SwapFn macapk_egl14_window_swap_fn() {
+    static const auto f = macapk_egl14_native_window_on()
+        ? reinterpret_cast<MacapkEgl14SwapFn>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_swap"))
+        : nullptr;
+    return f;
+}
+static void* macapk_egl14_window_resolve(void* dpy, void* surf) {
+    static const auto f = macapk_egl14_native_window_on()
+        ? reinterpret_cast<MacapkEgl14ResolveFn>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_resolve"))
+        : nullptr;
+    return (f && surf) ? f(dpy, surf) : surf;
+}
+
 extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
     using SwapFn = unsigned (*)(void*, void*);
     static SwapFn real =
@@ -37510,6 +37588,13 @@ extern "C" unsigned __macapk_arm64_eglSwapBuffers(void* dpy, void* surf) {
             }
         }
     }
+    // An EGL14 window: queue the frame to its SurfaceTexture, then swap the
+    // pbuffer now behind the handle, exactly as EGL14_eglSwapBuffers does (a
+    // pbuffer swap is only an implicit flush, but its error is the one the app
+    // reads).
+    if (MacapkEgl14SwapFn egl14Swap = macapk_egl14_window_swap_fn()) {
+        if (egl14Swap(dpy, surf) >= 0) surf = macapk_egl14_window_resolve(dpy, surf);
+    }
     if (macapk_swap_trace_on() && real) {
         const double t0 = macapk_swap_trace_uptime_s();
         const unsigned rc = real(dpy, surf);
@@ -37581,7 +37666,21 @@ extern "C" unsigned __macapk_arm64_eglMakeCurrent(void* dpy, void* draw,
     using McFn = unsigned (*)(void*, void*, void*, void*);
     static McFn real =
         reinterpret_cast<McFn>(dlsym(RTLD_DEFAULT, "eglMakeCurrent"));
-    return real ? real(dpy, draw, read, ctx) : 0;
+    // A Java EGL14 window's handle names the pbuffer behind it now (GitHub #16;
+    // see macapk_egl14_window_resolve), as EGL14_eglMakeCurrent translates it.
+    return real ? real(dpy, macapk_egl14_window_resolve(dpy, draw),
+                       macapk_egl14_window_resolve(dpy, read), ctx) : 0;
+}
+
+// eglQuerySurface: a forward to ANGLE that names a Java EGL14 window's current
+// pbuffer (GitHub #16), so native code sizing its viewport from EGL_WIDTH /
+// EGL_HEIGHT sees the window's size after a resize, as the Java bridge does.
+extern "C" unsigned __macapk_arm64_eglQuerySurface(void* dpy, void* surf,
+                                                     int32_t attribute, int32_t* value) {
+    using QsFn = unsigned (*)(void*, void*, int32_t, int32_t*);
+    static QsFn real =
+        reinterpret_cast<QsFn>(dlsym(RTLD_DEFAULT, "eglQuerySurface"));
+    return real ? real(dpy, macapk_egl14_window_resolve(dpy, surf), attribute, value) : 0;
 }
 
 // (Tombstone: macapk_unity_present_if_current, the flush/finish/clear-time
@@ -38768,11 +38867,14 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
         return reinterpret_cast<void*>(&__macapk_arm64_eglGetProcAddress);
     if (std::strcmp(name, "eglMakeCurrent") == 0)
         return reinterpret_cast<void*>(&__macapk_arm64_eglMakeCurrent);
+    if (std::strcmp(name, "eglQuerySurface") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglQuerySurface);
     // (The MACAPK_UNITY_PRESENT / MACAPK_TRACE_GL route of glFlush / glFinish /
     // glClear / glBindFramebuffer / glBlitFramebuffer to our shims is DELETED with
-    // the present injection; see __macapk_arm64_eglMakeCurrent. The three EGL
-    // routes above are unconditional and stay: the decouple ring and the present
-    // pacer live in __macapk_arm64_eglSwapBuffers.)
+    // the present injection; see __macapk_arm64_eglMakeCurrent. The EGL routes
+    // above are unconditional and stay: the decouple ring and the present pacer
+    // live in __macapk_arm64_eglSwapBuffers, and eglSwapBuffers / eglMakeCurrent /
+    // eglQuerySurface name a Java EGL14 window's current pbuffer, GitHub #16.)
     if (macapk_gl_trace_enabled()) {
         if (std::strcmp(name, "glDrawElements") == 0)
             return reinterpret_cast<void*>(&__macapk_arm64_glDrawElements);
@@ -59155,8 +59257,11 @@ extern "C" void __macapk_install_jni_bare_ellipsis_bridge(void* vtable);
 //     int ret = _stack_offset;
 //     _stack_offset += NOT_MACOS(wordSize) MACOS_ONLY(elem_size);   // <-- !
 //     return ret; }
-// pass_int -> next_stack_offset(sizeof(jint)=4) (also for Z/B/C/S, widened
-// to int); pass_float -> 4; pass_long/object/double -> 8.
+// pass_byte (Z/B) -> 1, pass_short (C/S) -> 2, pass_int / pass_float -> 4,
+// pass_long/object/double -> 8 (NativeSignatureIterator::do_type in
+// runtime/signature.hpp picks the pass_* per type). CORRECTED 2026-10-19:
+// this said Z/B/C/S were "widened to int" by pass_int, which is false for
+// stack args and mis-placed every arg after a stack boolean.
 //
 // Concrete failure that motivated this (Reddit / libcronet, the Chromium net
 // stack): org.chromium.base.AndroidInfo.fillFields(String x13, int sdkInt,
@@ -59303,6 +59408,14 @@ void* macapk_alloc_exec(const void* code, size_t len) {
 // uncertainty (fail safe -> passthrough). is_static is irrelevant: a static
 // method's jclass and an instance method's `this` each consume exactly one int
 // register (x1) after env (x0), so java args always begin at x2 either way.
+bool macapk_nmb_subint_as_int() {
+    static const bool v = [] {
+        const char* e = std::getenv("MACAPK_NMB_SUBINT_AS_INT");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
 void* macapk_build_aapcs_thunk(const char* sig, void* real_fn) {
     if (!sig || !real_fn) return nullptr;
     const char* p = std::strchr(sig, '(');
@@ -59331,9 +59444,24 @@ void* macapk_build_aapcs_thunk(const char* sig, void* real_fn) {
                 case 'J': size = 8; align = 8; break;
                 case 'D': size = 8; align = 8; is_fp = true; break;
                 case 'F': size = 4; align = 4; is_fp = true; break;
-                // Z/B/C/S are widened to int by HotSpot's pass_int -> 4 bytes.
-                case 'I': case 'S': case 'B': case 'C': case 'Z':
-                    size = 4; align = 4; break;
+                // Sub-int stack args keep their NATURAL size on macOS. jdk21u
+                // runtime/signature.hpp NativeSignatureIterator::do_type routes
+                // T_BYTE/T_BOOLEAN to pass_byte() and T_CHAR/T_SHORT to
+                // pass_short(), and interpreterRT_aarch64.cpp stores them with
+                // strb/strh at next_stack_offset(sizeof(jbyte)=1 / jshort=2).
+                // (The compiled native wrapper never handles these: on
+                // __APPLE__ c_calling_convention_priv returns -1 for any
+                // sub-word int/float stack arg, so the interpreter's handler
+                // always does.) They used to be modelled as 4 bytes here, which
+                // shifted every later stack arg: LibretroDroid.create's four
+                // trailing booleans put the ImmersiveMode object at the
+                // language jstring's slot. MACAPK_NMB_SUBINT_AS_INT=1 restores
+                // the old 4-byte model for bisection.
+                case 'Z': case 'B':
+                    size = align = macapk_nmb_subint_as_int() ? 4 : 1; break;
+                case 'C': case 'S':
+                    size = align = macapk_nmb_subint_as_int() ? 4 : 2; break;
+                case 'I': size = 4; align = 4; break;
                 default: return nullptr;   // V or unknown -> bail (passthrough)
             }
             ++p;

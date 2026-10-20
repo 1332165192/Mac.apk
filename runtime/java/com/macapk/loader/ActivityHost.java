@@ -2727,6 +2727,10 @@ public final class ActivityHost {
             }
         }
         if (claim) HostUrlIntake.claimRedirectSchemes(uri);
+        // A sign-in whose redirect_uri is one of this app's VERIFIED App Links
+        // opens in the Mac.apk sign-in window, which hands that redirect back
+        // the way a device browser does; Safari would load it as a page.
+        if (AppLinks.maybeOpenSignInWindow(uri)) return true;
         try {
             boolean ok = NativeCocoa.openHostUrl(uri);
             NativeLog.i(TAG, "implicit intent " + action + " -> host open("
@@ -2769,6 +2773,15 @@ public final class ActivityHost {
         if (cn != null) {
             final String pkg = cn.getPackageName();
             if (own == null || own.equals(pkg)) return intent;
+            // The platform package installer, pinned by the caller (a store
+            // picks InstallStart out of queryIntentActivities and setClassName()s
+            // it): performed by the installer surface, as the implicit start is.
+            if (MacApkPackageManager.macapkInstallerComponent()
+                    && MacApkPackageManager.macapkIsInstallerPackage(pkg)
+                    && InstallIntentHandler.isInstallIntent(intent)
+                    && resolveImplicitToHost(intent)) {
+                return null;
+            }
             // Stage 3a: a component of ANOTHER installed Mac.apk app is handed to
             // that app (resolveForStart: not narrowed by package visibility).
             if (CrossAppLauncher.XAPP_START && macapkCrossAppStart(own, intent, null)) return null;
@@ -2780,7 +2793,9 @@ public final class ActivityHost {
         try {
             android.content.pm.PackageManager pm = app != null ? app.getPackageManager() : null;
             if (pm != null) {
-                rows = pm.queryIntentActivities(intent,
+                // resolveForStart: registry rows are not narrowed by package
+                // visibility (MacApkPackageManager stage 4).
+                rows = MacApkPackageManager.macapkQueryForStart(pm, intent,
                         android.content.pm.PackageManager.MATCH_DEFAULT_ONLY);
             }
         } catch (Throwable t) {
@@ -2894,6 +2909,12 @@ public final class ActivityHost {
     }
 
     /** AOSP Intent.isWebIntent: ACTION_VIEW with an http/https data URI. */
+    /** AOSP Intent.isWebIntent (ACTION_VIEW of an http/https URI), for the PM's
+     *  stage-4 registry scan. */
+    static boolean macapkWebIntent(Intent intent) {
+        return intent != null && macapkIsWebIntent(intent);
+    }
+
     private static boolean macapkIsWebIntent(Intent intent) {
         if (!Intent.ACTION_VIEW.equals(intent.getAction())) return false;
         android.net.Uri d = intent.getData();

@@ -255,6 +255,20 @@ public enum Paths {
     /// Where per-app .app bundles are generated. See the note above.
     public static let bundlesDir = URL(fileURLWithPath: "/Applications", isDirectory: true)
 
+    /// Where each installed app's Android tree (its data) lives, one folder per
+    /// app: `~/Library/Application Support/MacApk/<package>/`. A SIBLING of
+    /// supportDir, not inside it, because a ".apk" substring in an app's data
+    /// path breaks guests (see AppDataLayout).
+    /// `MACAPK_APPDATA_ROOT` relocates it (harnesses that run the stub or the
+    /// generator on throwaway bundles).
+    public static let appDataDir: URL = {
+        if let e = ProcessInfo.processInfo.environment["MACAPK_APPDATA_ROOT"], !e.isEmpty {
+            return URL(fileURLWithPath: e, isDirectory: true)
+        }
+        return supportDir.deletingLastPathComponent()
+            .appendingPathComponent("MacApk", isDirectory: true)
+    }()
+
     // Sidecar locks. Separate files rather than locking the data file itself:
     // flock on the data file would be lost across the atomic rename that
     // replaces it, which is exactly the window two writers must not share.
@@ -285,6 +299,315 @@ public enum Paths {
         guard fm.fileExists(atPath: bundlesDir.path, isDirectory: &isDir), isDir.boolValue
         else { return false }
         return fm.isWritableFile(atPath: bundlesDir.path)
+    }
+}
+
+// MARK: - App data location (outside the bundle)
+
+/// Where an installed app's Android tree lives, and the move that puts it there.
+///
+/// WHY. Until v1.0.2251 an app's whole Android tree (data/data, sdcard, the
+/// code cache) lived INSIDE its bundle, at `<App>.app/Contents/android` (owner,
+/// 2026-10-19: "Data inside the .app is a real wart"). Every save the app wrote
+/// broke the bundle's code seal, Finder sizes counted saves as the app, and the
+/// data had no place the user could open and clean.
+///
+/// THE LAYOUT.
+///
+///     <App>.app/Contents/app/          the installed package (`~~<nonce>/<pkg>-<nonce>/
+///                                      base.apk` + splits): the APK IS the app, so
+///                                      it stays in the bundle, under its seal
+///     <App>.app/Contents/android  ->   ~/Library/Application Support/MacApk/<folder>
+///     MacApk/<folder>/data/app    ->   <App>.app/Contents/app
+///     MacApk/<folder>/data/data/<pkg>_<ver>/, sdcard/, .macapk/code/, ...
+///
+/// The runtime is still handed `<App>.app/Contents/android`, so every path a
+/// guest sees is exactly what it saw before (measured 2026-10-19 on Flappy Bird:
+/// launched from Finder through the link, the real folder's path appears nowhere
+/// in the run log). That is load-bearing twice over: the real path has a space
+/// ("Application Support"), which breaks guests that read their APK path out of
+/// a jar URL (BundleGenerator.apkSafeDirName); and the folder is "MacApk", not
+/// under "Mac.apk", because the runtime canonicalises some paths
+/// (AppClassLoader's dylib getCanonicalPath) and a ".apk" substring breaks guests
+/// that split a path at it (apk_unpacker.cpp ResolveAndroidRootDir).
+///
+/// `<folder>` is the package name (`-2`, `-3` for a second bundle of the same
+/// package). Deleting it is "Clear data": the next launch recreates it empty.
+/// Trashing the .app leaves it behind (the macOS norm); Mac.apk's uninstall
+/// trashes both (BundleGenerator.remove).
+///
+/// THE OWNERSHIP RECORD is the folder's `data/app` link: it names the bundle
+/// that owns the folder. That is what lets a move interrupted after the rename
+/// but before the bundle's link was made be finished on the next launch.
+///
+/// THE MOVE is three renames on one volume (never a copy): `data/app` into
+/// `Contents/app`, the tree to `<folder>`, then the link. Each failure undoes
+/// what came before it. `MACAPK_APPDATA_IN_BUNDLE=1`, or the file
+/// `<supportDir>/appdata-in-bundle`, stops new moves (moved apps stay moved);
+/// `debug/appdata_layout.sh revert` puts an app's data back inside its bundle.
+public enum AppDataLayout {
+
+    public static var root: URL { Paths.appDataDir }
+
+    public static func androidLink(_ bundle: URL) -> String { bundle.path + "/Contents/android" }
+    public static func appDir(_ bundle: URL) -> String { bundle.path + "/Contents/app" }
+
+    /// The kill switch for NEW moves (see the type comment).
+    public static var movesDisabled: Bool {
+        if ProcessInfo.processInfo.environment["MACAPK_APPDATA_IN_BUNDLE"] == "1" { return true }
+        return FileManager.default.fileExists(
+            atPath: Paths.supportDir.appendingPathComponent("appdata-in-bundle").path)
+    }
+
+    /// The real data folder of a bundle whose data has moved out, or nil.
+    public static func dataFolder(ofBundle bundle: URL) -> URL? {
+        guard let t = readLink(androidLink(bundle)) else { return nil }
+        return URL(fileURLWithPath: t, isDirectory: true)
+    }
+
+    // POSIX on purpose: FileManager resolves symlinks in the URLs it hands back,
+    // and every decision here is about the link itself.
+    static func fileType(_ p: String) -> mode_t? {
+        var st = stat()
+        return lstat(p, &st) == 0 ? (st.st_mode & S_IFMT) : nil
+    }
+    static func isDir(_ p: String) -> Bool { fileType(p) == S_IFDIR }
+    static func readLink(_ p: String) -> String? {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+        let n = readlink(p, &buf, Int(PATH_MAX))
+        guard n > 0 else { return nil }
+        buf[n] = 0
+        return String(cString: buf)
+    }
+    static func errText() -> String { String(cString: strerror(errno)) }
+
+    /// `<root>/<package>`, or the first free `-N` sibling. Never an existing
+    /// name: a leftover folder is somebody's data (a trashed bundle's, or one
+    /// the user kept) and is not silently handed to a new install.
+    static func freeFolder(for package: String) -> URL? {
+        var base = String(package.unicodeScalars.map { c -> Character in
+            switch c {
+            case "a"..."z", "A"..."Z", "0"..."9", ".", "_", "-": return Character(c)
+            default: return "_"
+            }
+        })
+        while base.hasPrefix(".") { base.removeFirst() }
+        if base.isEmpty { base = "app" }
+        for n in 1...99 {
+            let u = root.appendingPathComponent(n == 1 ? base : "\(base)-\(n)", isDirectory: true)
+            if fileType(u.path) == nil { return u }
+        }
+        return nil
+    }
+
+    /// The folder whose `data/app` link names this bundle: a move that renamed
+    /// the tree but died before linking it.
+    static func folderOwned(by bundle: URL) -> URL? {
+        let want = appDir(bundle)
+        guard let kids = try? FileManager.default.contentsOfDirectory(atPath: root.path)
+        else { return nil }
+        for k in kids.sorted() where !k.hasPrefix(".") {
+            let f = root.appendingPathComponent(k, isDirectory: true)
+            if readLink(f.path + "/data/app") == want { return f }
+        }
+        return nil
+    }
+
+    /// The skeleton a fresh tree needs (the same two dirs the stub creates):
+    /// data/data and .macapk/code. The runtime makes the rest.
+    static func createSkeleton(_ folder: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: folder.appendingPathComponent("data/data", isDirectory: true),
+                               withIntermediateDirectories: true)
+        try fm.createDirectory(at: folder.appendingPathComponent(".macapk/code", isDirectory: true),
+                               withIntermediateDirectories: true)
+    }
+
+    /// Point `<folder>/data/app` at this bundle's `Contents/app`. Heals a bundle
+    /// that was moved or renamed (the link is absolute), and brings an install
+    /// dir that landed in the folder back into the bundle.
+    static func repairAppLink(folder: URL, bundle: URL, log: (String) -> Void) {
+        let inApp = folder.path + "/data/app"
+        let app = appDir(bundle)
+        if isDir(inApp) {
+            guard fileType(app) == nil else {
+                log("app data: both \(inApp) and \(app) exist; leaving both as they are")
+                return
+            }
+            if rename(inApp, app) != 0 {
+                log("app data: could not move \(inApp) into the bundle: \(errText())")
+                return
+            }
+            log("app data: moved the installed package back into \(app)")
+        }
+        if fileType(app) == nil {
+            try? FileManager.default.createDirectory(atPath: app, withIntermediateDirectories: true)
+        }
+        if let have = readLink(inApp) {
+            if have == app { return }
+            unlink(inApp)
+            log("app data: \(inApp) pointed at \(have); now \(app) (the bundle moved)")
+        }
+        try? FileManager.default.createDirectory(atPath: folder.path + "/data",
+                                                 withIntermediateDirectories: true)
+        if symlink(app, inApp) != 0 {
+            log("app data: could not link \(inApp) -> \(app): \(errText())")
+        }
+    }
+
+    /// Make `bundle` use the out-of-bundle layout. Idempotent and cheap once
+    /// done. The caller must hold what keeps the app from running meanwhile:
+    /// the stub holds its pidfile flock, an install holds the install lock on a
+    /// bundle it is generating; `mayMove: false` (the stub without its lock)
+    /// limits this to the repairs. Returns the data folder, or nil when the data
+    /// stays inside the bundle (moves disabled, another volume, or a failure
+    /// that was rolled back -- the app still launches from the bundle then).
+    @discardableResult
+    public static func ensure(bundle: URL, package: String, mayMove: Bool = true,
+                              log: (String) -> Void) -> URL? {
+        let link = androidLink(bundle)
+        // Already moved: heal the folder and its link back to the bundle.
+        if let target = readLink(link) {
+            let folder = URL(fileURLWithPath: target, isDirectory: true)
+            if !isDir(folder.path) {
+                // The user deleted it ("clear data"), or it never existed.
+                do { try createSkeleton(folder) } catch {
+                    log("app data: \(folder.path) is missing and could not be created: \(error)")
+                    return nil
+                }
+                log("app data: \(folder.path) was missing; created it empty, "
+                    + "so the app starts with fresh data")
+            }
+            repairAppLink(folder: folder, bundle: bundle, log: log)
+            return folder
+        }
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        } catch {
+            log("app data: could not create \(root.path): \(error)")
+            return nil
+        }
+        // Nothing at Contents/android: finish an interrupted move, or start a
+        // bundle that never had a tree.
+        if fileType(link) == nil {
+            if let owned = folderOwned(by: bundle) {
+                if symlink(owned.path, link) == 0 {
+                    log("app data: finished an interrupted move, \(link) -> \(owned.path)")
+                    return owned
+                }
+                log("app data: could not link \(link) -> \(owned.path): \(errText())")
+                return nil
+            }
+            if movesDisabled { return nil }
+            guard let folder = freeFolder(for: package) else {
+                log("app data: no free folder name for \(package) under \(root.path)")
+                return nil
+            }
+            do { try createSkeleton(folder) } catch {
+                log("app data: could not create \(folder.path): \(error)")
+                return nil
+            }
+            repairAppLink(folder: folder, bundle: bundle, log: log)
+            if symlink(folder.path, link) != 0 {
+                log("app data: could not link \(link) -> \(folder.path): \(errText())")
+                try? FileManager.default.removeItem(at: folder)
+                return nil
+            }
+            log("app data: new folder \(folder.path)")
+            return folder
+        }
+        guard isDir(link) else {
+            log("app data: \(link) is neither a folder nor a link; leaving it")
+            return nil
+        }
+        if movesDisabled { return nil }
+        guard mayMove else {
+            log("app data: still inside the bundle; it moves on a launch that holds the app's lock")
+            return nil
+        }
+        return move(bundle: bundle, package: package, log: log)
+    }
+
+    /// The legacy layout -> the new one. See the type comment for the steps.
+    static func move(bundle: URL, package: String, log: (String) -> Void) -> URL? {
+        let src = androidLink(bundle)
+        let app = appDir(bundle)
+        let inApp = src + "/data/app"
+        // Same volume or nothing: a copy of a multi-GB tree on a full disk is the
+        // failure this must never cause. /Applications and ~/Library are both on
+        // the Data volume on a stock Mac.
+        var sa = stat(), sb = stat()
+        guard stat(bundle.path + "/Contents", &sa) == 0, stat(root.path, &sb) == 0,
+              sa.st_dev == sb.st_dev else {
+            log("app data: \(bundle.path) is not on the same volume as \(root.path); "
+                + "leaving its data inside the bundle")
+            return nil
+        }
+        guard let folder = freeFolder(for: package) else {
+            log("app data: no free folder name for \(package) under \(root.path)")
+            return nil
+        }
+        // 1. The installed package into the bundle, linked from where it was.
+        var movedApp = false, linkedApp = false
+        if isDir(inApp) {
+            guard fileType(app) == nil else {
+                log("app data: \(app) already exists beside \(inApp); leaving the data inside")
+                return nil
+            }
+            guard rename(inApp, app) == 0 else {
+                log("app data: could not move \(inApp) to \(app): \(errText())")
+                return nil
+            }
+            movedApp = true
+        } else if fileType(app) == nil {
+            try? FileManager.default.createDirectory(atPath: app, withIntermediateDirectories: true)
+        }
+        func undoApp() {
+            if linkedApp { unlink(inApp) }
+            if movedApp { rename(app, inApp) }
+        }
+        if readLink(inApp) != app {
+            if fileType(inApp) != nil { unlink(inApp) }
+            try? FileManager.default.createDirectory(atPath: src + "/data",
+                                                     withIntermediateDirectories: true)
+            guard symlink(app, inApp) == 0 else {
+                log("app data: could not link \(inApp) -> \(app): \(errText())")
+                undoApp()
+                return nil
+            }
+            linkedApp = true
+        }
+        // 2. The tree out of the bundle.
+        guard rename(src, folder.path) == 0 else {
+            log("app data: could not move \(src) to \(folder.path): \(errText())")
+            undoApp()
+            return nil
+        }
+        // 3. The bundle's link to it.
+        guard symlink(folder.path, src) == 0 else {
+            log("app data: could not link \(src) -> \(folder.path): \(errText()); moving it back")
+            if rename(folder.path, src) == 0 { undoApp() }
+            return nil
+        }
+        log("app data: moved out of the bundle to \(folder.path)")
+        return folder
+    }
+
+    /// Trash the data folder of a bundle that is being uninstalled. Only the
+    /// folder this bundle's link names, and only a direct child of `root`.
+    /// Read the folder BEFORE the bundle goes (the link goes with it).
+    public static func trashFolder(_ folder: URL, log: (String) -> Void) {
+        let parent = folder.deletingLastPathComponent().standardizedFileURL.path
+        guard parent == root.standardizedFileURL.path, isDir(folder.path) else {
+            log("app data: not trashing \(folder.path) (not a folder directly in \(root.path))")
+            return
+        }
+        do {
+            try FileManager.default.trashItem(at: folder, resultingItemURL: nil)
+            log("app data: trashed \(folder.path)")
+        } catch {
+            log("app data: could not trash \(folder.path): \(error)")
+        }
     }
 }
 
@@ -928,6 +1251,20 @@ public enum AppState {
     public static let installed  = "installed"
     public static let broken     = "broken"
 
+    /// The control panel's own install path (MacApkLauncherApp's
+    /// `InstalledApp`, every drag-drop / double-click / Open With install)
+    /// wrote `"ok"` for an installed app until v1.0.2239. Swift's own readers
+    /// mostly accepted it, but the guest-side readers did not
+    /// (MacApkPackageManager's registry, SpecialAccessStore.selfIdentity) and
+    /// neither did the install helper's CallerIdentity -- so such an app was
+    /// invisible to PackageManager and had every runtime permission refused
+    /// ("no installed app's bundle holds android root", Rhythm, issue #11).
+    /// One spelling on every read: decode maps it, and the next write persists it.
+    public static let legacyInstalled = "ok"
+    public static func normalized(_ s: String) -> String {
+        s == legacyInstalled ? installed : s
+    }
+
     /// The app's macOS bundle is GONE from disk, so the package is not
     /// installed -- but we still know about it, and its retained APK is still
     /// under `Paths.apksDir`, so reinstalling is a local copy rather than a
@@ -1494,6 +1831,12 @@ public final class RegistryStore: @unchecked Sendable {
             reg.readOnly = true
             log?("[registry] schema \(reg.schema) is newer than \(Registry.currentSchema); READ-ONLY")
         }
+        // Every reader sees ONE spelling of installed, and the next mutate
+        // (a stub's touchLastLaunched on every launch is one) persists it, which
+        // heals a registry the pre-v1.0.2239 control panel wrote.
+        for i in reg.apps.indices where reg.apps[i].state == AppState.legacyInstalled {
+            reg.apps[i].state = AppState.installed
+        }
         return reg
     }
 
@@ -1813,15 +2156,19 @@ public enum ApkRetention {
     public static func installedBaseApk(androidRoot: URL, package: String? = nil) -> URL? {
         let fm = FileManager.default
         let appRoot = androidRoot.appendingPathComponent("data/app", isDirectory: true)
-        guard let nonces = try? fm.contentsOfDirectory(at: appRoot,
-                                                        includingPropertiesForKeys: nil,
-                                                        options: [.skipsHiddenFiles])
-        else { return nil }
+        // Names, not URLs: contentsOfDirectory(at:) hands back RESOLVED paths, and
+        // data/app is a link into the bundle since the app data moved out
+        // (AppDataLayout). The runtime needs the path as the guest sees it,
+        // <root>/data/app/~~<nonce>/<pkg>-<nonce>/base.apk: it checks that shape
+        // lexically (main.cpp install_dir) and reports it as sourceDir.
+        func children(_ dir: URL) -> [URL]? {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return nil }
+            return names.filter { !$0.hasPrefix(".") }
+                .map { dir.appendingPathComponent($0, isDirectory: true) }
+        }
+        guard let nonces = children(appRoot) else { return nil }
         for nonce in nonces.sorted(by: { $0.path < $1.path }) {
-            guard let pkgs = try? fm.contentsOfDirectory(at: nonce,
-                                                          includingPropertiesForKeys: nil,
-                                                          options: [.skipsHiddenFiles])
-            else { continue }
+            guard let pkgs = children(nonce) else { continue }
             // v1.0.1641: the PACKAGE's own install dir first. A stray
             // `<other>-<nonce>` (measured: Instagram's `base-Qm..`, left by a
             // manifest read that fell back to the file name) sorts before
@@ -5040,6 +5387,21 @@ public enum RuntimeInstall {
         candidates.append(contentsOf: extra)
         candidates.append(URL(fileURLWithPath: "/Applications/Mac.apk.app/Contents",
                               isDirectory: true))
+        // A per-user install (~/Applications/Mac.apk.app) is a normal place to
+        // put an app, and a user who cannot write /Applications has no other.
+        // Before this the control panel running from there found no payload of
+        // its own (Runtime: Install disabled, "carries no runtime payload"),
+        // because the GUI calls state()/install() with no `extra`. GitHub #13.
+        candidates.append(FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications/Mac.apk.app/Contents", isDirectory: true))
+        // Last, the bundle THIS binary ships in, wherever it was put (any
+        // folder, a renamed copy). Only the control panel and the install
+        // helper carry Resources/macapk-runtime; a per-app stub's own bundle
+        // does not, so for a stub this candidate never matches. Kept after the
+        // fixed locations so an existing /Applications install still wins.
+        let me = (Bundle.main.executableURL
+                  ?? URL(fileURLWithPath: CommandLine.arguments[0])).resolvingSymlinksInPath()
+        candidates.append(me.deletingLastPathComponent().deletingLastPathComponent())
         for c in candidates {
             // The runtime binary may legitimately be non-executable here (that
             // is what uninstall does to it), so test EXISTENCE, not the bit --

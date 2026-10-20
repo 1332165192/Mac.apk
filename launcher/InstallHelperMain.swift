@@ -1147,7 +1147,11 @@ enum CallerIdentity {
             return Row(dirName: a["dirName"] as? String ?? "", package: pkg,
                        label: a["label"] as? String ?? pkg, installedAt: inst,
                        bundlePath: a["bundlePath"] as? String ?? "",
-                       state: a["state"] as? String ?? "installed")
+                       // "ok" is the control panel's legacy spelling of
+                       // installed (AppState.normalized); reading it as anything
+                       // else refused every runtime permission for an app
+                       // installed by drag-drop or double-click (issue #11).
+                       state: AppState.normalized(a["state"] as? String ?? "installed"))
         }
     }
 

@@ -1448,6 +1448,22 @@ public final class PackageInstallerBackend {
         return dir;
     }
 
+    /** Where the Mac.apk control panel (Mac.apk.app) may live, in order:
+     *  MACAPK_CANONICAL_APP (the app stub exports the one it resolved, which
+     *  covers any folder Launch Services knows), /Applications, then the
+     *  per-user ~/Applications (GitHub #13). The staged shared runtime ships
+     *  neither macapk-installhelper nor the location helper, so an installed
+     *  app finds both here. */
+    public static java.util.List<File> canonicalAppCandidates() {
+        java.util.List<File> out = new java.util.ArrayList<>();
+        String env = System.getenv("MACAPK_CANONICAL_APP");
+        if (env != null && !env.isEmpty()) out.add(new File(env));
+        out.add(new File("/Applications/Mac.apk.app"));
+        String home = System.getProperty("user.home");
+        if (home != null && !home.isEmpty()) out.add(new File(home, "Applications/Mac.apk.app"));
+        return out;
+    }
+
     /** Find the install helper, for BOTH install surfaces (InstallIntentHandler
      *  delegates here; it used to carry an identical private copy). Order: the
      *  MACAPK_INSTALLHELPER environment export (picks WHICH binary we ask, not
@@ -1479,9 +1495,14 @@ public final class PackageInstallerBackend {
                 }
             }
         } catch (Throwable ignored) {}
-        File canonical = new File(
-                "/Applications/Mac.apk.app/Contents/bin/macapk-installhelper");
-        return canonical.canExecute() ? canonical : null;
+        // The control panel: MACAPK_CANONICAL_APP (the stub exports the one it
+        // resolved), then the two standard install locations (GitHub #13: a
+        // Mac.apk in ~/Applications left installed apps with no helper).
+        for (File app : PackageInstallerBackend.canonicalAppCandidates()) {
+            File f = new File(app, "Contents/bin/macapk-installhelper");
+            if (f.canExecute()) return f;
+        }
+        return null;
     }
 
     public static final class HelperResult {

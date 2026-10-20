@@ -6,6 +6,7 @@
 // same main thread.
 
 #include "macapk/jvm_loader.h"
+#include "macapk/jit_wx_guard.h"
 
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
@@ -755,6 +756,11 @@ void StartJvm(const JvmConfig& cfg, JavaVM** out_vm, JNIEnv** out_env) {
         }
     }
 
+    // macOS 27 with hardware TPRO (seen with SIP disabled) resets the JIT
+    // write bit inside dlopen, and HotSpot's code-cache writes in create_vm
+    // then fault. Must be in place before the VM's first WX switch.
+    InstallJvmJitWxGuard();
+
     *out_vm  = nullptr;
     *out_env = nullptr;
     jint rc = JNI_CreateJavaVM(out_vm, reinterpret_cast<void**>(out_env), &vm_args);
@@ -764,6 +770,7 @@ void StartJvm(const JvmConfig& cfg, JavaVM** out_vm, JNIEnv** out_env) {
                      static_cast<int>(rc));
         std::abort();
     }
+    LogJvmJitWxGuardStats();
     LogCriticalReleaseSemantics(*out_env, SelectedCollector(owned_options));
     if (aot.active && !aot.recording) {
         // Did it MAP? java.vm.info carries "sharing" exactly when an archive (the AOT

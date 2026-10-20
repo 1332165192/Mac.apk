@@ -2436,6 +2436,10 @@ static void* macapk_shim_self_handle() {
     return h;
 }
 
+// bionic_shim_vulkan.cpp: the guest libvulkan.so's symbol for `name`, or null
+// when this app gets no Vulkan.
+extern "C" void* __macapk_guest_vulkan_symbol(const char* name);
+
 static void* macapk_shim_dlsym(const char* name) {
     void* h = macapk_shim_self_handle();
     void* p = h ? dlsym(h, name) : dlsym(RTLD_DEFAULT, name);
@@ -2761,6 +2765,27 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
     // address into the GOT slot, the guest calls the wrong function forever.
     // See the adapter block above resolve_external for the paired prototypes.
     if (void* p = macapk_bionic_adapter(name)) return p;
+
+    // Then a vk* import of a library linked against libvulkan.so: the guest's
+    // libvulkan is MoltenVK plus the VK_KHR_android_surface translation
+    // (bionic_shim_vulkan.cpp), the same resolver dlsym(<libvulkan.so>, name)
+    // uses, so a direct call and a dlsym'd pointer reach the same function.
+    // GitHub #17: MapLibre's renderer links -lvulkan and calls
+    // vkCreateInstance directly; before this every vk* import fell to the
+    // RTLD_DEFAULT lookup below, which cannot see MoltenVK (opened RTLD_LOCAL,
+    // and only on the first libvulkan dlopen), so the binder trapped them all.
+    // This must come BEFORE that lookup: a globally visible Khronos loader
+    // (ANGLE's, under MACAPK_ANGLE_BACKEND=vulkan) also exports vkCreateInstance,
+    // and binding the guest to it would skip the surface translation. Keyed on
+    // the importer's DT_NEEDED, as bionic resolves an import from the library's
+    // own dependencies; a vk* name in a library that does not link libvulkan
+    // (volk-style function-pointer globals) is left to the usual lookups. When
+    // this app gets no Vulkan the resolver answers null and the lookups below
+    // run exactly as before.
+    if (name.size() > 2 && name[0] == 'v' && name[1] == 'k' &&
+        std::find(needed_.begin(), needed_.end(), "libvulkan.so") != needed_.end()) {
+        if (void* p = __macapk_guest_vulkan_symbol(name.c_str())) return p;
+    }
 
     // Then any host-process symbol (libSystem libc/libm/libpthread,
     // libc++, ANGLE, the shim's directly-exported Bionic names like

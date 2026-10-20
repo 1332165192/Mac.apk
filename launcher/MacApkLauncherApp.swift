@@ -73,6 +73,22 @@ struct MacApkLauncherApp: App {
     @StateObject private var updates = UpdateChecker.shared
 
     init() {
+        // Harness-only settings never belong in the owner's control panel
+        // (owner, 2026-10-19: "the mac.apk app still launches apps in the
+        // background"). scripts/rebuild_and_run.sh ends with `open` on this
+        // app, and a thread's install shell that exported MACAPK_NO_ACTIVATE=1
+        // handed it to us: the live launcher (started 23:43:49 by the 23:43:45
+        // v1.0.2275 install) carried MACAPK_NO_ACTIVATE=1 and
+        // MACAPK_INSTALL_LOCK_HELD, and every app opened from the drawer
+        // inherited the first, so each one ordered its window behind. Settings
+        // typed into this window (defaultEnv, an app's Get Info env) are passed
+        // explicitly per launch and are unaffected.
+        for name in ["MACAPK_NO_ACTIVATE", "MACAPK_PAUSE_WHEN_HIDDEN",
+                     "MACAPK_INSTALL_LOCK_HELD", "MACAPK_INJECT_FILE",
+                     "MACAPK_DEBUG_HOSTKEY_FILE", "MACAPK_RECORD_INPUT",
+                     "MACAPK_EXTERNAL_URLS"] {
+            unsetenv(name)
+        }
         // After the first runloop turn, when SwiftUI has built the main menu.
         DispatchQueue.main.async { HelpMenuRemover.install() }
     }
@@ -2712,6 +2728,33 @@ struct LauncherView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+                // Owner, 2026-10-19: app data moved out of the bundles into one
+                // folder per app (AppDataLayout), and settings opens it so the
+                // data is easy to look at and clean.
+                Section("App data") {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Saves, caches and files")
+                        Spacer()
+                        Button("Open App Data Folder") { openAppDataFolder() }
+                    }
+                    Text("Each installed app keeps its data in its own folder here, "
+                       + "named after its package. Deleting an app's folder clears "
+                       + "its data, and the app starts fresh the next time it opens.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    // Owner, 2026-10-20: Android's Download, Documents, Pictures,
+                    // Movies and Music are the Mac's own folders (SharedStorage
+                    // USER_FOLDER_MAP, on since v1.0.1657). The runtime reads
+                    // this switch from a file, since a Dock-launched app gets no
+                    // environment from here (SharedStorage.userFoldersOffFile).
+                    Toggle("Use my Mac's Downloads, Documents, Pictures, Movies and Music",
+                           isOn: macFoldersBinding)
+                    Text("Android apps see these as their own Download, Documents, Pictures, "
+                       + "Movies and Music folders. Turning this off takes effect the next "
+                       + "time each app opens; your files stay in your Mac folders.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
                 if model.devMenuRevealed {
                     Section("App files") {
                         // The path itself is deliberately NOT rendered here
@@ -3699,6 +3742,37 @@ struct LauncherView: View {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    /// The "Use my Mac's folders" switch: ON unless the off file exists. The file
+    /// is what the runtime reads (SharedStorage.userFoldersOffFile); writing it
+    /// directly keeps one source of truth with nothing to sync.
+    private static var macFoldersOffFile: URL {
+        Paths.supportDir.appendingPathComponent("user-folders-off")
+    }
+    @State private var macFoldersOn: Bool =
+        !FileManager.default.fileExists(atPath: macFoldersOffFile.path)
+    private var macFoldersBinding: Binding<Bool> {
+        Binding(get: { macFoldersOn }, set: { on in
+            let f = Self.macFoldersOffFile
+            if on {
+                try? FileManager.default.removeItem(at: f)
+            } else {
+                try? FileManager.default.createDirectory(
+                    at: f.deletingLastPathComponent(), withIntermediateDirectories: true)
+                FileManager.default.createFile(atPath: f.path, contents: Data())
+            }
+            macFoldersOn = !FileManager.default.fileExists(atPath: f.path)
+        })
+    }
+
+    /// Opens ~/Library/Application Support/MacApk (AppDataLayout.root) itself,
+    /// rather than selecting it in its parent, so the per-app folders are what
+    /// Finder shows.
+    private func openAppDataFolder() {
+        let url = AppDataLayout.root
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(url)
+    }
+
     /// Translate the launcher's settings (APK path, screen preset,
     /// orientation, verbose) into the argv expected by macapk-runtime.
     private func runtimeArgs() -> [String] {
@@ -4601,7 +4675,9 @@ extension InstalledApp {
                   apkPath: apkPath, originalApkPath: originalApkPath,
                   bundlePath: bundlePath, installedAt: installedAt,
                   updatedAt: updatedAt, lastLaunchedAt: lastLaunchedAt,
-                  source: source, env: env, state: state)
+                  // "ok" is this struct's in-memory word for a healthy app; the
+                  // registry's is "installed" (AppState.normalized).
+                  source: source, env: env, state: AppState.normalized(state))
     }
 }
 
@@ -5922,7 +5998,7 @@ struct AppDetailSheet: View {
                     .foregroundColor(.secondary)
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting(
-                        [library.dataDir(for: current)])
+                        [library.dataDir(for: current).resolvingSymlinksInPath()])
                 } label: { Image(systemName: "arrow.up.right.square") }
                     .disabled(health.dataDirMissing)
                     .help("Reveal this app's folder in Finder.")
@@ -6347,7 +6423,8 @@ struct InstalledAppsView: View {
                 .disabled(library.health(for: app).apkMissing)
             }
             Button("Reveal install dir in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([library.dataDir(for: app)])
+                NSWorkspace.shared.activateFileViewerSelecting(
+                    [library.dataDir(for: app).resolvingSymlinksInPath()])
             }
             .disabled(library.health(for: app).dataDirMissing)
             // Stage S1: Android's special app access for this app, as Settings

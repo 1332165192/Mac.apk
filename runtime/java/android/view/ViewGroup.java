@@ -821,6 +821,14 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
      *  clear the previously-focused branch, and propagate to the parent so the
      *  whole root->leaf chain points at the new focus. */
     @Override public void requestChildFocus(View child, View focused) {
+        // AOSP ViewGroup.requestChildFocus (android14): a blocking group ignores
+        // the request, and a group that held focus ITSELF gives it up
+        // (super.unFocus) once a descendant takes it. Without the unFocus a
+        // RecyclerView that had focus kept mIsFocused=true under its newly
+        // focused child, so findFocus() stopped at the RecyclerView and every
+        // D-pad key went to it rather than to the focused card.
+        if (getDescendantFocusability() == FOCUS_BLOCK_DESCENDANTS) return;
+        super.unFocus(focused);
         if (mFocused != child) {
             if (mFocused != null) mFocused.unFocus(focused);  // clear the old focused branch
             mFocused = child;
@@ -836,6 +844,52 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     /** AOSP ViewGroup.hasFocus: this view or any descendant along mFocused. */
     @Override public boolean hasFocus() {
         return mIsFocused || (mFocused != null && mFocused.hasFocus());
+    }
+    /** AOSP ViewGroup.hasFocusable(boolean, boolean) (android14 :1266-1288) +
+     *  hasFocusableChild (:1290-1306): a VISIBLE group is "focusable" when it is
+     *  itself, or, unless it blocks descendants, when any child is.
+     *
+     *  ⚠ ViewGroup inherited View's self-only answer, so a non-focusable wrapper
+     *  around a focusable view reported "nothing focusable here". RecyclerView /
+     *  leanback GridLayoutManager.onAddFocusables skip every child whose
+     *  hasFocusable() is false, so in leanback's headers sidebar (each header is a
+     *  focusable view inside a plain NoOverlappingFrameLayout wrapper) a D-pad
+     *  Down found 0 focusables and the selection never moved. */
+    @Override
+    boolean hasFocusable(boolean allowAutoFocus, boolean dispatchExplicit) {
+        if (getVisibility() != VISIBLE) return false;
+        if ((allowAutoFocus || getFocusable() != FOCUSABLE_AUTO) && isFocusable()) return true;
+        if (getDescendantFocusability() != FOCUS_BLOCK_DESCENDANTS) {
+            for (int i = 0; i < children.size(); i++) {
+                View child = children.get(i);
+                if (child == null) continue;
+                if (dispatchExplicit ? child.hasExplicitFocusable() : child.hasFocusable()) return true;
+            }
+        }
+        return false;
+    }
+
+    /** AOSP ViewGroup.handleFocusGainInternal (android14 :841-848): a group that
+     *  takes focus ITSELF first unfocuses the descendant branch it was holding.
+     *  Without it the old focused child kept mIsFocused under a focused parent:
+     *  leanback's HeadersSupportFragment.onTransitionStart calls
+     *  listView.requestFocus() on its headers grid while a header holds focus,
+     *  and every later focus move "succeeded" on the stale header while
+     *  findFocus() kept answering the grid, so the arrows stopped moving. */
+    @Override
+    void handleFocusGainInternal(int direction, android.graphics.Rect previouslyFocusedRect) {
+        if (mFocused != null) {
+            mFocused.unFocus(this);
+            mFocused = null;
+        }
+        super.handleFocusGainInternal(direction, previouslyFocusedRect);
+    }
+
+    /** AOSP ViewGroup.dispatchUnhandledMove: pass the focus move that found no
+     *  target down the mFocused chain, so the focused view (a ViewPager, a
+     *  leanback grid) gets the last chance to act on the D-pad key. */
+    @Override public boolean dispatchUnhandledMove(View focused, int direction) {
+        return mFocused != null && mFocused.dispatchUnhandledMove(focused, direction);
     }
     /** AOSP ViewGroup.findFocus: walk the mFocused chain to the focused leaf. */
     @Override public View findFocus() {
@@ -3404,7 +3458,7 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
      *  touchscreen -- except when it is a keyboard-navigation cluster that
      *  already holds focus, or is not the top-most cluster of its subtree, in
      *  which case cluster navigation may enter it and move freely inside. */
-    private boolean shouldBlockFocusForTouchscreen() {
+    boolean shouldBlockFocusForTouchscreen() {
         if (!getTouchscreenBlocksFocus()) return false;
         boolean hasTouchscreen = true;
         try {
@@ -3865,19 +3919,71 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
         return false;
     }
 
-    /** AOSP ViewGroup.dispatchGenericPointerEvent (:2534-2563) sends a pointer
-     *  event to the child UNDER the pointer. Ours still walks every child,
-     *  top-most first, which is what this class's dispatchGenericMotionEvent
-     *  did for every source before 2026-10-02. Nothing in Mac.apk produces a
-     *  SOURCE_CLASS_POINTER generic event yet (the host mouse is delivered as
-     *  touch, and its wheel is not delivered), so the hit test is left for the
-     *  change that adds one. */
+    /** AOSP ViewGroup.dispatchGenericPointerEvent (android14-release
+     *  ViewGroup.java:2534-2563): a pointer generic event (a mouse wheel's
+     *  ACTION_SCROLL) goes to the child UNDER THE POINTER, top-most first, in the
+     *  child's own coordinates (dispatchTransformedGenericPointerEvent
+     *  :2589-2604); if none handles it, this group's own View half runs (its
+     *  listener, then onGenericMotionEvent), which is how a list nested in a
+     *  scroller hands a wheel step it cannot use to the scroller around it.
+     *  WheelScroll.VIEWS=0 keeps the old walk: every child in turn, untransformed,
+     *  whatever the pointer position. */
     @Override protected boolean dispatchGenericPointerEvent(MotionEvent event) {
-        for (int i = children.size() - 1; i >= 0; i--) {
-            View c = children.get(i);
-            if (c != null && c.dispatchGenericMotionEvent(event)) return true;
+        if (!com.macapk.loader.WheelScroll.VIEWS) {
+            for (int i = children.size() - 1; i >= 0; i--) {
+                View c = children.get(i);
+                if (c != null && c.dispatchGenericMotionEvent(event)) return true;
+            }
+            return super.dispatchGenericPointerEvent(event);
+        }
+        final int childrenCount = children.size();
+        if (childrenCount != 0) {
+            final float x = event.getX();
+            final float y = event.getY();
+            final java.util.ArrayList<View> preorderedList = buildOrderedChildList();
+            final boolean customOrder = preorderedList == null
+                    && isChildrenDrawingOrderEnabled();
+            try {
+                for (int i = childrenCount - 1; i >= 0; i--) {
+                    final int childIndex =
+                            getAndVerifyPreorderedIndex(childrenCount, i, customOrder);
+                    final View child = getAndVerifyPreorderedView(preorderedList, childIndex);
+                    if (child == null || !child.canReceivePointerEvents()
+                            || !isTransformedTouchPointInView(x, y, child, null)) {
+                        continue;
+                    }
+                    if (dispatchTransformedGenericPointerEvent(event, child)) return true;
+                }
+            } finally {
+                if (preorderedList != null) preorderedList.clear();
+            }
         }
         return super.dispatchGenericPointerEvent(event);
+    }
+
+    /** AOSP :2589-2604, with the same child-offset rules as
+     *  dispatchTransformedTouchEvent (macapkSkipOffset, the inverse matrix). */
+    private boolean dispatchTransformedGenericPointerEvent(MotionEvent event, View child) {
+        if (!child.macapkHasTransform()) {
+            if (macapkSkipOffset(child)) return child.dispatchGenericMotionEvent(event);
+            final float offsetX = getScrollX() - child.getLeft();
+            final float offsetY = getScrollY() - child.getTop();
+            event.offsetLocation(offsetX, offsetY);
+            try { return child.dispatchGenericMotionEvent(event); }
+            finally { event.offsetLocation(-offsetX, -offsetY); }
+        }
+        final MotionEvent transformedEvent = MotionEvent.obtain(event);
+        try {
+            if (!macapkSkipOffset(child)) {
+                transformedEvent.offsetLocation(getScrollX() - child.getLeft(),
+                                                getScrollY() - child.getTop());
+            }
+            android.graphics.Matrix inv = macapkChildInverseMatrix(child);
+            if (inv != null) transformedEvent.transform(inv);
+            return child.dispatchGenericMotionEvent(transformedEvent);
+        } finally {
+            transformedEvent.recycle();
+        }
     }
 
     /** AOSP ViewGroup.getOverlay covariantly returns a ViewGroupOverlay. Apps
@@ -3922,10 +4028,55 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
     }
     public boolean getTouchscreenBlocksFocus() { return mTouchscreenBlocksFocus; }
 
-    /** AOSP default: subclasses that want to intercept a descendant focus
-     *  request override this; the base returns false (do not intercept). */
+    /** AOSP ViewGroup.requestFocus(int, Rect) (android14 :3309-3341): dispatch
+     *  on descendantFocusability -- BLOCK: this group only; BEFORE: this group,
+     *  then its descendants; AFTER: descendants first, then this group.
+     *
+     *  ⚠ ViewGroup inherited View's leaf-only requestFocus, so asking a
+     *  container for focus never reached a child: root.restoreDefaultFocus()
+     *  (what leaving touch mode and an unfocused D-pad press call), a
+     *  RecyclerView's or leanback grid's requestFocus(), and every app's
+     *  `container.requestFocus()` returned false with nothing focused. Tab
+     *  worked only because FocusFinder hands focus to a LEAF directly. */
+    @Override
+    public boolean requestFocus(int direction, android.graphics.Rect previouslyFocusedRect) {
+        switch (getDescendantFocusability()) {
+            case FOCUS_BLOCK_DESCENDANTS:
+                return super.requestFocus(direction, previouslyFocusedRect);
+            case FOCUS_AFTER_DESCENDANTS: {
+                final boolean took = onRequestFocusInDescendants(direction, previouslyFocusedRect);
+                return took || super.requestFocus(direction, previouslyFocusedRect);
+            }
+            case FOCUS_BEFORE_DESCENDANTS:
+            default: {
+                final boolean took = super.requestFocus(direction, previouslyFocusedRect);
+                return took || onRequestFocusInDescendants(direction, previouslyFocusedRect);
+            }
+        }
+    }
+
+    /** AOSP ViewGroup.onRequestFocusInDescendants (android14 :3355-3381): offer
+     *  focus to each VISIBLE child in order (reverse order unless the direction
+     *  carries FOCUS_FORWARD's bit, which FOCUS_DOWN does), first taker wins.
+     *  Subclasses (RecyclerView, ScrollView, leanback's BrowseFrameLayout and
+     *  grids) override it. It returned false, the "do not intercept" reading of
+     *  a hook whose base implementation IS the descent. */
     protected boolean onRequestFocusInDescendants(int direction,
             android.graphics.Rect previouslyFocusedRect) {
+        final int count = children.size();
+        int index, increment, end;
+        if ((direction & FOCUS_FORWARD) != 0) {
+            index = 0; increment = 1; end = count;
+        } else {
+            index = count - 1; increment = -1; end = -1;
+        }
+        for (int i = index; i != end; i += increment) {
+            View child = (i < children.size()) ? children.get(i) : null;
+            if (child != null && child.getVisibility() == VISIBLE
+                    && child.requestFocus(direction, previouslyFocusedRect)) {
+                return true;
+            }
+        }
         return false;
     }
 
