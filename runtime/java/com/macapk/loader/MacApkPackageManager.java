@@ -1221,8 +1221,10 @@ public final class MacApkPackageManager extends PackageManager {
         // WHY A DIRECTORY mtime. Removing (or adding) an entry updates the
         // containing directory's mtime, so one stat answers "could anything
         // have appeared or vanished" without walking bundles or stating each
-        // app. It is deliberately coarse: it costs one stat per PM query and
-        // over-fires (any /Applications change triggers it), which is the
+        // app. It is deliberately coarse: it costs a stat per bundle folder
+        // per PM query (/Applications and ~/Applications, where a user who
+        // cannot write /Applications gets their apps, GitHub #28) and
+        // over-fires (any change to either triggers it), which is the
         // right way round -- an extra reconcile is cheap and idempotent, a
         // missed one leaves a store lying about installed apps.
         //
@@ -1237,15 +1239,22 @@ public final class MacApkPackageManager extends PackageManager {
                 reconcileInFlight = new java.util.concurrent.atomic.AtomicBoolean(false);
         private static volatile long lastReconcileNanos = 0L;
 
-        /** Ask the helper to re-run its reconcile if /Applications changed.
+        /** Ask the helper to re-run its reconcile if a bundle folder changed.
          *  Never blocks the caller: a PM query must not wait on a subprocess.
          *  The rewritten registry is picked up by the NEXT snapshot() -- the
          *  same poll-driven honesty announceRemovals already documents. */
         private static void maybeReconcileBundles() {
-            java.io.File dir = new java.io.File("/Applications");
+            // One number for both folders: a change to either moves it. A
+            // missing ~/Applications reads 0 and simply never moves.
             long m;
-            try { m = dir.lastModified(); } catch (Throwable t) { return; }
-            if (m == 0L) return;
+            try {
+                String[] roots = CrossAppLauncher.bundleRoots();
+                m = new java.io.File(roots[0]).lastModified();
+                if (m == 0L) return;
+                for (int i = 1; i < roots.length; i++) {
+                    m = m * 31 + new java.io.File(roots[i]).lastModified();
+                }
+            } catch (Throwable t) { return; }
             long prev = bundlesDirMtime.getAndSet(m);
             if (prev < 0) return;          // first observation: baseline only
             if (prev == m) return;         // nothing appeared or vanished
@@ -1264,7 +1273,7 @@ public final class MacApkPackageManager extends PackageManager {
                             .redirectErrorStream(true).start();
                     p.getInputStream().close();
                     p.waitFor();
-                    logOnce("[PM.registry] /Applications changed; ran helper reconcile"
+                    logOnce("[PM.registry] a bundle folder changed; ran helper reconcile"
                             + " (a bundle may have been added or removed outside the"
                             + " install path)");
                 } catch (Throwable ignored) {

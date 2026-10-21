@@ -63,6 +63,9 @@ public class SQLiteDatabase extends SQLiteClosable {
     private long dbHandle;
     /** Path opened; used for diagnostics + reopen logic. */
     private final String path;
+    /** Opened with OPEN_READONLY (AOSP isReadOnly: the connection's open
+     *  flags). Cleared by reopenReadWrite. */
+    private volatile boolean readOnly;
     // Transaction state is PER-THREAD, exactly like AOSP. See the long
     // comment above beginTransaction() for the model, the citation, and
     // the Aurora Store bug this shape fixed. The fields live in TxState;
@@ -87,6 +90,7 @@ public class SQLiteDatabase extends SQLiteClosable {
                 "sqlite3_open_v2(\"" + this.path + "\") failed: "
                 + NativeSqlite.nativeLastOpenError());
         }
+        this.readOnly = (flags & OPEN_READONLY) != 0;
     }
 
     /** Memory-only DB for callers that don't supply a path. Used by
@@ -131,7 +135,33 @@ public class SQLiteDatabase extends SQLiteClosable {
         close();
     }
     public synchronized boolean isOpen()    { return dbHandle != 0; }
-    public boolean isReadOnly()             { return false; }
+    public boolean isReadOnly()             { return readOnly; }
+
+    /**
+     * AOSP (@hide, used by SQLiteOpenHelper): reopen a database that was
+     * opened read-only so it can be written. AOSP reconfigures its connection
+     * pool with OPEN_READWRITE; we run one connection, so we open a read-write
+     * sqlite3* on the same path and swap it in. The old handle goes through
+     * sqlite3_close_v2, which keeps it alive (a zombie) until any statement
+     * still prepared on it is finalized.
+     */
+    public synchronized void reopenReadWrite() {
+        if (dbHandle == 0) {
+            throw new IllegalStateException(
+                "attempt to re-open an already-closed object: SQLiteDatabase: " + path);
+        }
+        if (!readOnly) return;
+        long rw = NativeSqlite.nativeOpen(path, NativeSqlite.SQLITE_OPEN_READWRITE);
+        if (rw == 0) {
+            throw new SQLiteCantOpenDatabaseException(
+                "sqlite3_open_v2(\"" + path + "\", READWRITE) failed: "
+                + NativeSqlite.nativeLastOpenError());
+        }
+        long old = dbHandle;
+        dbHandle = rw;
+        readOnly = false;
+        NativeSqlite.nativeClose(old);
+    }
     public String  getPath()                { return path; }
 
     long macapkDbHandle()                 { return dbHandle; }  // package-private for cursor/stmt

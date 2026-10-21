@@ -6,7 +6,8 @@
 // pipeline (InstallCore.swift, which also provides `Paths`).
 //
 // Bundle contract (per-app bundle layout):
-//   <Paths.bundlesDir>/<Label>.app/Contents/
+//   <Paths.bundlesDir>/<Label>.app/Contents/   (/Applications, or
+//                           ~/Applications for a user who cannot write it)
 //     Info.plist            identity (bundle id org.macapk.app.<pkgSanitized>)
 //     PkgInfo               "APPL????"
 //     MacOS/<Label>         the stub (copy of the pre-signed template)
@@ -113,7 +114,7 @@ enum BundleGenerator {
         }
         let template = try stubTemplateURL()
 
-        let bundlesDir = Paths.bundlesDir
+        let bundlesDir = homeFolder(for: spec, dirName: dirName)
         var isDir: ObjCBool = false
         if !(fm.fileExists(atPath: bundlesDir.path, isDirectory: &isDir) && isDir.boolValue) {
             throw BundleGeneratorError.bundlesDirUnavailable(bundlesDir.path)
@@ -122,6 +123,7 @@ enum BundleGenerator {
         let name = try resolveBundleName(for: spec, dirName: dirName, in: bundlesDir)
         let finalURL = bundlesDir.appendingPathComponent("\(name).app", isDirectory: true)
         recoverInterruptedSwap(name: name, finalURL: finalURL, in: bundlesDir)
+        genLog("bundle folder: \(bundlesDir.path)")
 
         // Hidden same-directory staging sibling: same volume, so every
         // swap below is a rename, and Finder never shows the dot-dir.
@@ -131,7 +133,7 @@ enum BundleGenerator {
 
         do {
             try buildStagingBundle(spec: spec, name: name, dirName: dirName,
-                                   template: template, at: staging)
+                                   template: template, at: staging, finalURL: finalURL)
         } catch {
             try? fm.removeItem(at: staging)
             throw BundleGeneratorError.stagingFailed(String(describing: error))
@@ -487,7 +489,8 @@ enum BundleGenerator {
 
     /// Move a generated bundle to the Trash (user-recoverable; the app's
     /// data rides inside it) after unregistering it from LaunchServices.
-    /// Hard guards: only direct children of Paths.bundlesDir, only .app
+    /// Hard guards: only direct children of a bundle folder
+    /// (Paths.bundleDirs: /Applications or ~/Applications), only .app
     /// directories, never through a symlink, and only bundles carrying our
     /// org.macapk.app. identifier -- this function must be incapable of
     /// deleting anything we did not generate.
@@ -498,11 +501,12 @@ enum BundleGenerator {
             throw BundleGeneratorError.removeRefused("\(bundleAt.path) is a symlink")
         }
         let resolved = bundleAt.resolvingSymlinksInPath().standardizedFileURL
-        let root = Paths.bundlesDir.resolvingSymlinksInPath().standardizedFileURL
-        guard resolved.deletingLastPathComponent().path == root.path else {
+        guard let home = Paths.bundleDir(containing: resolved) else {
             throw BundleGeneratorError.removeRefused(
-                "\(resolved.path) is not directly inside \(root.path)")
+                "\(resolved.path) is not directly inside "
+                + Paths.bundleDirs.map(\.path).joined(separator: " or "))
         }
+        let root = home.resolvingSymlinksInPath().standardizedFileURL
         guard resolved.pathExtension == "app" else {
             throw BundleGeneratorError.removeRefused("\(resolved.path) is not a .app")
         }
@@ -707,6 +711,33 @@ enum BundleGenerator {
         return mode
     }
 
+    /// The bundle folder `generate()` works in for this record: the writable
+    /// folder that already holds its bundle (an update regenerates in place,
+    /// with its data), else `Paths.bundlesDir` -- /Applications, or
+    /// ~/Applications for a user who cannot write it (GitHub #28).
+    ///
+    /// A bundle found only in a folder this user CANNOT write (an admin put
+    /// it in /Applications) is not regenerated there -- that is the 513
+    /// failure -- so the new one goes to the writable folder and the log says
+    /// two copies now exist.
+    /// internal so debug/bundlesdir_gate.sh can drive it.
+    static func homeFolder(for spec: BundleSpec, dirName: String?) -> URL {
+        let wantDir = (identityMode() == .version) ? dirName : nil
+        var lockedOut: URL?
+        for d in Paths.bundleDirs {
+            guard let n = existingBundleName(matching: spec.package, dirName: wantDir, in: d)
+            else { continue }
+            if Paths.isWritableDir(d) { return d }
+            if lockedOut == nil { lockedOut = d.appendingPathComponent("\(n).app") }
+        }
+        let target = Paths.prepareBundlesDir()
+        if let l = lockedOut {
+            genLog("\(l.path) is not writable for this user; installing a separate "
+                 + "copy in \(target.path)")
+        }
+        return target
+    }
+
     // internal (not private) so debug/bundlename_gate.sh can drive it against
     // a temp directory; nothing outside this file calls it.
     static func resolveBundleName(for spec: BundleSpec, dirName: String?,
@@ -826,7 +857,8 @@ enum BundleGenerator {
 
     private static func buildStagingBundle(spec: BundleSpec, name: String,
                                            dirName: String?,
-                                           template: URL, at staging: URL) throws {
+                                           template: URL, at staging: URL,
+                                           finalURL: URL) throws {
         let fm = FileManager.default
         let contents = staging.appendingPathComponent("Contents", isDirectory: true)
         let macos = contents.appendingPathComponent("MacOS", isDirectory: true)
@@ -902,7 +934,6 @@ enum BundleGenerator {
         // for a DIFFERENT bundle; give the newcomer a free one instead.
         let baseId = "org.macapk.app." + (dirName.map(sanitizedBundleIdPackage)
                                           ?? sanitizedBundleIdPackage(spec.package))
-        let finalURL = Paths.bundlesDir.appendingPathComponent("\(name).app")
         let plist = infoPlistXML(spec: spec, executableName: name, dirName: dirName,
                                  bundleIdentifier: uniqueBundleIdentifier(baseId, excluding: finalURL))
         try plist.write(to: contents.appendingPathComponent("Info.plist"),
@@ -918,13 +949,12 @@ enum BundleGenerator {
                              atomically: true, encoding: .utf8)
     }
 
-    /// `base`, or `base-2`, `base-3`, ... when another bundle in the bundles
-    /// dir (not `excluding`, the bundle being regenerated) already carries it.
+    /// `base`, or `base-2`, `base-3`, ... when another bundle in either
+    /// bundle folder (not `excluding`, the bundle being regenerated) already
+    /// carries it. Both folders, because Launch Services sees both.
     static func uniqueBundleIdentifier(_ base: String, excluding: URL) -> String {
-        let fm = FileManager.default
         var taken = Set<String>()
-        for n in (try? fm.contentsOfDirectory(atPath: Paths.bundlesDir.path)) ?? [] where n.hasSuffix(".app") {
-            let u = Paths.bundlesDir.appendingPathComponent(n)
+        for u in Paths.bundleCandidates() {
             if u.standardizedFileURL.path == excluding.standardizedFileURL.path { continue }
             let pl = u.appendingPathComponent("Contents/Info.plist")
             if let d = try? Data(contentsOf: pl),

@@ -442,7 +442,28 @@ public class Activity extends ContextThemeWrapper
     }
     public void onConfigurationChanged(Configuration newConfig) {}
     public void onWindowFocusChanged(boolean hasFocus) {}
-    public boolean onCreateOptionsMenu(android.view.Menu menu) { return false; }
+    /** AOSP Activity.onCreateOptionsMenu: `if (mParent != null) return
+     *  mParent.onCreateOptionsMenu(menu); return true;` (android14-release
+     *  Activity.java:4622). We hosted no parent activities, so the answer is
+     *  true. It was false, which told AppCompat's ToolbarActionBar that an
+     *  activity without its own onCreateOptionsMenu has no options panel; see
+     *  MACAPK_ACTIVITY_MENU_AOSP below for what that broke. */
+    public boolean onCreateOptionsMenu(android.view.Menu menu) { return MACAPK_ACTIVITY_MENU_AOSP; }
+    /** BISECT GATE (2026-10-20, default ON): the base Activity's options-panel
+     *  answers are AOSP's -- onCreateOptionsMenu true, onPreparePanel returns
+     *  onPrepareOptionsMenu's answer (no "has visible items" test; AOSP has none
+     *  there, android14 Activity.java:4478). AppCompat's
+     *  ToolbarActionBar.populateOptionsMenu calls onCreatePanelMenu &&
+     *  onPreparePanel, and only a TRUE onPreparePanel reaches
+     *  ToolbarCallbackWrapper's mDecorToolbar.setMenuPrepared(); until then
+     *  ToolbarWidgetWrapper's navigation-button listener returns without calling
+     *  onMenuItemSelected(home). So on any AppCompat activity with a support
+     *  Toolbar and no menu items of its own, the Up / drawer button did nothing:
+     *  Rangskat's hamburger never reached onSupportNavigateUp and the drawer
+     *  never opened. MACAPK_ACTIVITY_MENU_AOSP=0 restores the old false / the
+     *  hasVisibleItems() test. */
+    static final boolean MACAPK_ACTIVITY_MENU_AOSP =
+        !"0".equals(System.getenv("MACAPK_ACTIVITY_MENU_AOSP"));
     public boolean onOptionsItemSelected(MenuItem item) { return false; }
     public boolean onPrepareOptionsMenu(android.view.Menu menu) { return true; }
     /** AOSP Activity.invalidateOptionsMenu() forces a re-create on
@@ -633,8 +654,9 @@ public class Activity extends ContextThemeWrapper
     // AppCompatWindowCallback which (via WindowCallbackWrapper) forwards to
     // the wrapped callback -- this Activity. So these route the toolbar
     // menu through the app's onCreateOptionsMenu/onPrepareOptionsMenu, the
-    // same as on a real device. The menu is kept iff BOTH return true, so
-    // onPreparePanel must report menu.hasVisibleItems() once inflated.
+    // same as on a real device. The menu is kept iff BOTH return true, and a
+    // true onPreparePanel is also what marks the support Toolbar's menu as
+    // prepared, which its navigation button needs (MACAPK_ACTIVITY_MENU_AOSP).
     private static final boolean sMenuTrace = System.getenv("MACAPK_MENU_TRACE") != null;
     @Override
     public boolean onCreatePanelMenu(int featureId, android.view.Menu menu) {
@@ -662,7 +684,12 @@ public class Activity extends ContextThemeWrapper
     public boolean onPreparePanel(int featureId, View view, android.view.Menu menu) {
         if (featureId == Window.FEATURE_OPTIONS_PANEL && menu != null) {
             boolean goforit = onPrepareOptionsMenu(menu);
-            return goforit && menu.hasVisibleItems();
+            // AOSP also ORs in mFragments.dispatchPrepareOptionsMenu (and
+            // onCreatePanelMenu mFragments.dispatchCreateOptionsMenu); our
+            // platform FragmentManagerImpl has no options-menu dispatch yet, so
+            // android.app.Fragment menus are not merged here. androidx
+            // fragments are dispatched by FragmentActivity itself.
+            return MACAPK_ACTIVITY_MENU_AOSP ? goforit : (goforit && menu.hasVisibleItems());
         }
         return true;
     }

@@ -86,7 +86,10 @@ struct MacApkLauncherApp: App {
         for name in ["MACAPK_NO_ACTIVATE", "MACAPK_PAUSE_WHEN_HIDDEN",
                      "MACAPK_INSTALL_LOCK_HELD", "MACAPK_INJECT_FILE",
                      "MACAPK_DEBUG_HOSTKEY_FILE", "MACAPK_RECORD_INPUT",
-                     "MACAPK_EXTERNAL_URLS"] {
+                     "MACAPK_EXTERNAL_URLS",
+                     // Bundle-folder seams for debug/bundlesdir_gate.sh only:
+                     // the control panel always installs into the real folders.
+                     "MACAPK_SYSTEM_APPS_DIR", "MACAPK_USER_APPS_DIR"] {
             unsetenv(name)
         }
         // After the first runloop turn, when SwiftUI has built the main menu.

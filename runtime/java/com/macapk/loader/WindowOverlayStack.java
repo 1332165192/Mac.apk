@@ -493,6 +493,58 @@ public final class WindowOverlayStack {
         return false;
     }
 
+    /** HOVER (GitHub #25): which window the pointer hovers, by deliverPointerGeneric's
+     *  rules -- the top-most touchable layer containing the point (its view), or
+     *  HOVER_SWALLOWED when a modal layer above it owns the pointer, or null for
+     *  the activity window underneath. TouchDispatcher sends HOVER_ENTER / EXIT
+     *  when this answer changes, as InputDispatcher does per window. */
+    public static final Object HOVER_SWALLOWED = new Object();
+    public static Object hoverWindowAt(float contentX, float contentY) {
+        final List<Layer> layers = snapshot();
+        for (int i = layers.size() - 1; i >= 0; i--) {
+            Layer layer = layers.get(i);
+            View v = layer.view;
+            if (v == null || v.getVisibility() != View.VISIBLE) continue;
+            int flags = layer.params != null ? layer.params.flags : 0;
+            if ((flags & WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) != 0) continue;
+            if (layer.bounds.contains((int) contentX, (int) contentY)) return v;
+            final boolean nonModal = NOT_FOCUSABLE_IS_NOT_MODAL
+                ? (flags & (WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)) != 0
+                : (flags & WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL) != 0;
+            if (nonModal) continue;
+            return HOVER_SWALLOWED;
+        }
+        return null;
+    }
+    /** Hand one generic pointer event to the layer whose root view is
+     *  `layerView`, in that layer's coordinates, through its Dialog's window
+     *  callback when it has one (as deliverPointerGeneric does). False when the
+     *  layer has gone. */
+    public static boolean deliverGenericToLayer(View layerView, android.view.MotionEvent ev,
+                                                float contentX, float contentY) {
+        for (Layer layer : snapshot()) {
+            if (layer.view != layerView) continue;
+            final float dx = (contentX - layer.bounds.left) - ev.getX();
+            final float dy = (contentY - layer.bounds.top) - ev.getY();
+            ev.offsetLocation(dx, dy);
+            try {
+                android.app.Dialog d = (layer.owner != null) ? layer.owner.get() : null;
+                android.view.Window w = d != null ? d.getWindow() : null;
+                android.view.Window.Callback cb = w != null ? w.getCallback() : null;
+                if (cb != null) cb.dispatchGenericMotionEvent(ev);
+                else layerView.dispatchGenericMotionEvent(ev);
+            } catch (Throwable t) {
+                try { NativeLog.w("Mac.apk.Overlay", "overlay hover threw: " + t); } catch (Throwable ig) { }
+            } finally {
+                ev.offsetLocation(-dx, -dy);
+            }
+            sDirty = true;
+            return true;
+        }
+        return false;
+    }
+
     public static int deliverKeyResult(android.view.KeyEvent ev) {
         List<Layer> layers = snapshot();
         for (int i = layers.size() - 1; i >= 0; i--) {

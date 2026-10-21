@@ -195,6 +195,11 @@ public final class TouchDispatcher {
 
     static MotionEvent touchEvent(long downTime, long eventTime, int action,
                                           float x, float y, int metaState) {
+        // A host MOUSE stream (dispatchHostMouse) is being delivered: every event
+        // built for it -- the activity's, an overlay window's, a drag source's
+        // cancel -- is what CursorInputMapper emits, not a finger.
+        final HostMouseState m = s_deliveringMouse;
+        if (m != null) return mouseEvent(downTime, eventTime, action, x, y, m.buttonState, m.metaState);
         MotionEvent.PointerProperties p = new MotionEvent.PointerProperties();
         p.id = 0;
         p.toolType = MotionEvent.TOOL_TYPE_FINGER;
@@ -253,7 +258,7 @@ public final class TouchDispatcher {
      *  `doDispatch` exactly so both paths land in the same pixel space. */
     public void dispatchPinch(int phase, float cx, float cy, float span, float viewW, float viewH) {
         if (TRACKPAD_MULTITOUCH) {
-            trackpadPinch(phase, cx, cy, span, viewW, viewH);
+            trackpadPinch(phase, cx, cy, span, 0f, viewW, viewH);
             return;
         }
         if (InputRecorder.ON) InputRecorder.unrecorded("legacy pinch (MACAPK_TRACKPAD_MULTITOUCH=0)");
@@ -262,6 +267,18 @@ public final class TouchDispatcher {
         } catch (Throwable t) {
             doDispatchPinch(phase, cx, cy, span, viewW, viewH);
         }
+    }
+
+    /** The synthesized two-finger stream cocoa_bridge.mm sends for a trackpad
+     *  pinch AND a trackpad twist (rotateWithEvent:, GitHub #22): `span` is the
+     *  finger separation and `angle` the axis between them (radians, counter-
+     *  clockwise, view points with y up; 0 = side by side, the pinch). With
+     *  MACAPK_TRACKPAD_MULTITOUCH=0 the old pinch body runs and a twist only
+     *  moves nothing (that body has no angle). */
+    public void dispatchTwoFinger(int phase, float cx, float cy, float span, float angle,
+                                  float viewW, float viewH) {
+        if (!TRACKPAD_MULTITOUCH) { dispatchPinch(phase, cx, cy, span, viewW, viewH); return; }
+        trackpadPinch(phase, cx, cy, span, angle, viewW, viewH);
     }
 
     private void doDispatchPinch(int phase, float cx, float cy, float span,
@@ -404,11 +421,24 @@ public final class TouchDispatcher {
      *  GestureConverter::handlePinch emits). Pure, so the gate can assert it. */
     static java.util.ArrayList<TrackpadGestureMapper.Motion> pinchMotions(
             int phase, float cx, float cy, float span, float viewH, float scale, long down) {
+        return pinchMotions(phase, cx, cy, span, 0f, viewH, scale, down);
+    }
+
+    /** The same, with the two fingers' axis turned by `angle` (radians, CCW in
+     *  the host's y-up view space; surface y runs down, so a CCW turn moves
+     *  finger 1 UP the surface). angle 0 is the plain pinch. */
+    static java.util.ArrayList<TrackpadGestureMapper.Motion> pinchMotions(
+            int phase, float cx, float cy, float span, float angle, float viewH, float scale, long down) {
         final float px = surfaceX(cx, scale), py = surfaceY(cy, viewH, scale);
         final float half = Math.max(8f, span * scale) / 2f;
+        float ox = half, oy = 0f;
+        // GATE-MUTANT(trackpad:rotate) begin -- debug/trackpad_gate.sh C10 deletes this
+        ox = (float) (half * Math.cos(angle));
+        oy = (float) (-half * Math.sin(angle));
+        // GATE-MUTANT(trackpad:rotate) end
         final int[] one = {0}, two = {0, 1};
-        final float[] xs2 = {px - half, px + half}, ys2 = {py, py};
-        final float[] xs1 = {px - half}, ys1 = {py};
+        final float[] xs2 = {px - ox, px + ox}, ys2 = {py - oy, py + oy};
+        final float[] xs1 = {px - ox}, ys1 = {py - oy};
         final java.util.ArrayList<TrackpadGestureMapper.Motion> out = new java.util.ArrayList<>(2);
         if (phase == 0) {
             out.add(new TrackpadGestureMapper.Motion(MotionEvent.ACTION_DOWN, 0, down, one, xs1, ys1));
@@ -422,7 +452,8 @@ public final class TouchDispatcher {
         return out;
     }
 
-    private void trackpadPinch(int phase, float cx, float cy, float span, float viewW, float viewH) {
+    private void trackpadPinch(int phase, float cx, float cy, float span, float angle,
+                               float viewW, float viewH) {
         // A pinch the system recognized owns these fingers: end any hold first
         // (AOSP GestureConverter::handlePinch likewise starts from a clean
         // classification), so the app never sees two streams interleave.
@@ -432,7 +463,7 @@ public final class TouchDispatcher {
         if (phase == 0) s_pinchDownTime = now;
         final long down = s_pinchDownTime != 0L ? s_pinchDownTime : now;
         final java.util.ArrayList<TrackpadGestureMapper.Motion> out =
-            pinchMotions(phase, cx, cy, span, viewH, scale, down);
+            pinchMotions(phase, cx, cy, span, angle, viewH, scale, down);
         if (phase != 0 && phase != 1) s_pinchDownTime = 0L;
         deliverTrackpad(out, "pinch");
     }
@@ -512,7 +543,12 @@ public final class TouchDispatcher {
         if (action == MotionEvent.ACTION_POINTER_DOWN || action == MotionEvent.ACTION_POINTER_UP)
             action |= m.index << MotionEvent.ACTION_POINTER_INDEX_SHIFT;
         // GATE-MUTANT(trackpad:index) end
+        // eventTime: when it happened (the engage burst carries the landing time,
+        // GitHub #23), else now.
         long t = android.os.SystemClock.uptimeMillis();
+        // GATE-MUTANT(trackpad:evtime) begin -- debug/trackpad_gate.sh C9 deletes this
+        if (m.eventTime != 0L) t = m.eventTime;
+        // GATE-MUTANT(trackpad:evtime) end
         return MotionEvent.obtain(m.downTime != 0L ? m.downTime : t, t, action, count, props, coords,
                 0 /* metaState */, 0 /* buttonState */, 1f, 1f,
                 TOUCHSCREEN_DEVICE_ID, 0 /* edgeFlags */,
@@ -1391,6 +1427,8 @@ public final class TouchDispatcher {
         // magnify body a real trackpad runs, entered below the NSEvent decode.
         if (v.equals("trackpad") && n >= 3) return fractionsInRange(p, 2) ? "trackpad" : "reject";
         if (v.equals("magnify") && n >= 5) return fractionsInRange(p, 2) ? "magnify" : "reject";
+        if (v.equals("rotate") && n >= 5) return fractionsInRange(p, 2) ? "rotate" : "reject";
+        if (v.equals("hostscroll") && n >= 5) return fractionsInRange(p, 2) ? "hostscroll" : "reject";
         if (v.equals("hostwheel") && n >= 4) return fractionsInRange(p, 2) ? "hostwheel" : "reject";
         if (v.equals("close") || v.equals("quit") || v.equals("terminate")) return "quit";
         // Input-recorder events (InputRecorder; docs/input-recorder_2026-10-01.md):
@@ -1504,6 +1542,21 @@ public final class TouchDispatcher {
                         Float.parseFloat(p[2]), Float.parseFloat(p[3]), Float.parseFloat(p[4]) }))
                     NativeLog.w(TAG, "inject-driver: magnify found no input view");
                 break;
+            case "rotate":
+                // rotate <cursor fx> <cursor fy> <phase 0|1|2> <degrees, CCW +>
+                if (!NativeCocoa.debugTrackpad(3, new float[]{ Float.parseFloat(p[1]),
+                        Float.parseFloat(p[2]), Float.parseFloat(p[3]), Float.parseFloat(p[4]) }))
+                    NativeLog.w(TAG, "inject-driver: rotate found no input view");
+                break;
+            case "hostscroll": {
+                // hostscroll <fx> <fy> <phase 0|1|2> <dyPoints> [dxPoints]: one TRACKPAD
+                // scroll event through the host scrollWheel: body (kind 4).
+                float[] a = { Float.parseFloat(p[1]), Float.parseFloat(p[2]), Float.parseFloat(p[3]),
+                              Float.parseFloat(p[4]), p.length >= 6 ? Float.parseFloat(p[5]) : 0f };
+                if (!NativeCocoa.debugTrackpad(4, a))
+                    NativeLog.w(TAG, "inject-driver: hostscroll found no input view");
+                break;
+            }
             case "quit":
                 // The three ways a user leaves a Mac app, each on its real
                 // AppKit path (debug/closelat.sh).
@@ -2476,6 +2529,234 @@ public final class TouchDispatcher {
                 0 /* metaState */, 0 /* buttonState */, 1f, 1f,
                 0 /* deviceId: no mouse InputDevice is registered */, 0 /* edgeFlags */,
                 android.view.InputDevice.SOURCE_MOUSE, 0 /* flags */);
+    }
+
+    // ------------------------------------------------------------------
+    // HOST MOUSE as an Android mouse (MACAPK_MOUSE_POINTER, default ON).
+    //
+    // A host mouse used to arrive as a touchscreen FINGER with buttonState 0 and
+    // metaState 0, and only for the primary button, so an app could not tell a
+    // mouse drag from a finger drag, a right-drag from a left-drag, or a
+    // Ctrl/Shift drag from a plain one (GitHub #21: MapLibre Compose's
+    // right-drag / Ctrl-drag rotate and Shift-drag box select). Real Android
+    // (InputReader CursorInputMapper::sync, frameworks/native main) emits, per
+    // change of the pressed-button set, all SOURCE_MOUSE / TOOL_TYPE_MOUSE with
+    // metaState = the global meta state:
+    //   BUTTON_RELEASE for each released button (actionButton = it,
+    //   buttonState stepping down), then the main event -- DOWN when the first
+    //   of PRIMARY/SECONDARY/TERTIARY goes down, UP when the last comes up, MOVE
+    //   while one is held -- with buttonState = the new set, then
+    //   BUTTON_PRESS for each newly pressed button (buttonState stepping up).
+    // BUTTON_BACK / BUTTON_FORWARD (the side buttons) are not pointer-down
+    // buttons; they also synthesize KEYCODE_BACK / KEYCODE_FORWARD, the key DOWN
+    // before the motion events and the key UP after
+    // (TouchCursorInputMapperCommon synthesizeButtonKeys). DOWN/MOVE/UP go
+    // through the touch path (the window under the pointer, overlays first);
+    // BUTTON_PRESS/RELEASE are generic motion (MotionEvent.isTouchEvent is false
+    // for them), routed like a wheel step. A secondary click is NOT turned into
+    // BACK: AOSP forwards it as a pointer stream (View shows the context menu,
+    // performButtonActionOnTouchDown). Hover (no buttons) is #25.
+    // ------------------------------------------------------------------
+    static final boolean MOUSE_POINTER = !"0".equals(System.getenv("MACAPK_MOUSE_POINTER"));
+    private static final int POINTER_DOWN_BUTTONS = MotionEvent.BUTTON_PRIMARY
+            | MotionEvent.BUTTON_SECONDARY | MotionEvent.BUTTON_TERTIARY;
+    /** The pressed-button set as of the last host mouse event (AppKit thread). */
+    private static int s_hostMouseButtons;
+    static final class HostMouseState {
+        final int buttonState, metaState;
+        HostMouseState(int buttonState, int metaState) { this.buttonState = buttonState; this.metaState = metaState; }
+    }
+    /** Non-null while a host-mouse DOWN/MOVE/UP is being delivered (delivery
+     *  thread), so touchEvent builds mouse events for it. */
+    private static volatile HostMouseState s_deliveringMouse;
+
+    /** What CursorInputMapper builds for one main/hover event: one pointer,
+     *  TOOL_TYPE_MOUSE, SOURCE_MOUSE, pressure 1 while a button is down. Device
+     *  id 0, like the wheel step: no mouse InputDevice is registered. */
+    static MotionEvent mouseEvent(long downTime, long eventTime, int action,
+                                  float x, float y, int buttonState, int metaState) {
+        MotionEvent.PointerProperties p = new MotionEvent.PointerProperties();
+        p.id = 0;
+        p.toolType = MotionEvent.TOOL_TYPE_MOUSE;
+        MotionEvent.PointerCoords c = new MotionEvent.PointerCoords();
+        c.x = x; c.y = y;
+        c.pressure = (buttonState & POINTER_DOWN_BUTTONS) != 0 ? 1f : 0f;
+        c.size = 0f;
+        return MotionEvent.obtain(downTime, eventTime, action, 1,
+                new MotionEvent.PointerProperties[]{ p },
+                new MotionEvent.PointerCoords[]{ c },
+                metaState, buttonState, 1f, 1f,
+                0 /* deviceId */, 0 /* edgeFlags */,
+                android.view.InputDevice.SOURCE_MOUSE, 0 /* flags */);
+    }
+
+    /** Called from cocoa_bridge.mm for every host mouse button event: the
+     *  pressed set AFTER this event (AOSP BUTTON_* bits, which AppKit's button
+     *  numbers map onto 1:1), the meta state, and the pointer in view points. */
+    public void dispatchHostMouse(int buttonState, int metaState, float x, float y,
+                                  float viewW, float viewH) {
+        if (!MOUSE_POINTER) {
+            // The pre-change path (the native side normally never calls in under
+            // =0; this keeps the Java entry honest for the gate's control arm):
+            // the primary button as a touchscreen finger, every other button dropped.
+            final int lastP = s_hostMouseButtons & MotionEvent.BUTTON_PRIMARY;
+            s_hostMouseButtons = buttonState;
+            final int nowP = buttonState & MotionEvent.BUTTON_PRIMARY;
+            if (lastP == 0 && nowP != 0) dispatch(MotionEvent.ACTION_DOWN, x, y, viewW, viewH);
+            else if (lastP != 0 && nowP == 0) dispatch(MotionEvent.ACTION_UP, x, y, viewW, viewH);
+            else if (nowP != 0) dispatch(MotionEvent.ACTION_MOVE, x, y, viewW, viewH);
+            return;
+        }
+        final int last = s_hostMouseButtons;
+        s_hostMouseButtons = buttonState;
+        final boolean wasDown = (last & POINTER_DOWN_BUTTONS) != 0;
+        final boolean down = (buttonState & POINTER_DOWN_BUTTONS) != 0;
+        if (!wasDown && !down && last == buttonState) {
+            // No button changed and none is held: a HOVER_MOVE (CursorInputMapper:
+            // `down || source != MOUSE ? MOVE : HOVER_MOVE`), GitHub #25.
+            if (!android.view.View.HOVER_VIEWS) return;
+            Runnable h = () -> deliverHover(MotionEvent.ACTION_HOVER_MOVE, buttonState, metaState, x, y, viewH);
+            if (routeToLoop(ActivityHost.peek())) loopHandler().post(h); else h.run();
+            return;
+        }
+        noteRealInput();
+        if (TRACKPAD_MULTITOUCH) {
+            if (!wasDown && down) { s_hostPointerDown = true; trackpadClaim(false); }
+            else if (wasDown && !down) s_hostPointerDown = false;
+        }
+        Runnable r = () -> deliverHostMouse(last, buttonState, metaState, x, y, viewW, viewH);
+        if (routeToLoop(ActivityHost.peek())) loopHandler().post(r); else r.run();
+    }
+
+    private void deliverHostMouse(int last, int now, int meta, float x, float y,
+                                  float viewW, float viewH) {
+        final int pressed = now & ~last, released = last & ~now;
+        final boolean wasDown = (last & POINTER_DOWN_BUTTONS) != 0;
+        final boolean down = (now & POINTER_DOWN_BUTTONS) != 0;
+        // Side buttons: key DOWN first (synthesizeButtonKeys AKEY_EVENT_ACTION_DOWN).
+        sideButtonKeys(pressed, KeyEvent.ACTION_DOWN, meta);
+        final float scale = macapkBackingScale();
+        final float px = x * scale, py = (viewH - y) * scale;
+        int step = last;
+        for (int b = 1; b != 0 && (released & ~(b - 1)) != 0; b <<= 1) {
+            if ((released & b) == 0) continue;
+            step &= ~b;
+            deliverMouseButton(MotionEvent.ACTION_BUTTON_RELEASE, b, step, meta, px, py);
+        }
+        // InputDispatcher: a DOWN clears the device's hovering pointer, so the
+        // hovered window gets HOVER_EXIT before the DOWN ("Compatibility
+        // behaviour: ACTION_DOWN causes HOVER_EXIT to get generated").
+        if (!wasDown && down && android.view.View.HOVER_VIEWS) {
+            deliverHover(MotionEvent.ACTION_HOVER_EXIT, last, meta, x, y, viewH);
+        }
+        if (!wasDown && !down && android.view.View.HOVER_VIEWS) {
+            // Only a side button changed: the main event is a HOVER_MOVE.
+            deliverHover(MotionEvent.ACTION_HOVER_MOVE, now, meta, x, y, viewH);
+        }
+        if (wasDown || down) {
+            final int action = wasDown == down ? MotionEvent.ACTION_MOVE
+                    : (down ? MotionEvent.ACTION_DOWN : MotionEvent.ACTION_UP);
+            s_deliveringMouse = new HostMouseState(now, meta);
+            try {
+                doDispatch(action, x, y, viewW, viewH);
+            } finally {
+                s_deliveringMouse = null;
+            }
+        }
+        for (int b = 1; b != 0 && (pressed & ~(b - 1)) != 0; b <<= 1) {
+            if ((pressed & b) == 0) continue;
+            step |= b;
+            deliverMouseButton(MotionEvent.ACTION_BUTTON_PRESS, b, step, meta, px, py);
+        }
+        // CursorInputMapper: "Send hover move after UP to tell the application
+        // that the mouse is hovering now." The window gets it as HOVER_ENTER.
+        if (wasDown && !down && android.view.View.HOVER_VIEWS) {
+            deliverHover(MotionEvent.ACTION_HOVER_MOVE, now, meta, x, y, viewH);
+        }
+        sideButtonKeys(released, KeyEvent.ACTION_UP, meta);
+    }
+
+    // ------------------------------------------------------------------
+    // HOVER (GitHub #25, MACAPK_HOVER_EVENTS default ON). InputDispatcher sends
+    // a hovering mouse's events to the window under it: HOVER_ENTER to a window
+    // that newly has the pointer (instead of the raw HOVER_MOVE), HOVER_MOVE
+    // while it stays, HOVER_EXIT to a window it left, and HOVER_EXIT before a
+    // DOWN (getHoveringWindowsLocked / findTouchedWindowTargetsLocked,
+    // frameworks/native main). Inside the window the view tree routes it
+    // (ViewGroup.dispatchHoverEvent). s_hoverWindow is the window currently
+    // hovered: the Activity, an overlay layer's root view, or null.
+    // ------------------------------------------------------------------
+    private static Object s_hoverWindow;
+
+    /** Host pointer left our view (cocoa mouseExited:): the hovered window exits. */
+    public void dispatchHostMouseExit(float x, float y, float viewW, float viewH) {
+        if (!android.view.View.HOVER_VIEWS) return;
+        final int meta = 0;
+        Runnable h = () -> deliverHover(MotionEvent.ACTION_HOVER_EXIT, s_hostMouseButtons, meta, x, y, viewH);
+        if (routeToLoop(ActivityHost.peek())) loopHandler().post(h); else h.run();
+    }
+
+    /** action is HOVER_MOVE (re-targeted to ENTER / EXIT per window) or
+     *  HOVER_EXIT (the pointer left every window). x/y in view points. */
+    private static void deliverHover(int action, int buttonState, int meta,
+                                     float x, float y, float viewH) {
+        final Activity a = ActivityHost.peek();
+        if (a == null) { s_hoverWindow = null; return; }
+        final float scale = macapkBackingScale();
+        final float px = x * scale, py = (viewH - y) * scale;
+        final float contentY = py - StatusBarDriver.heightPx(null);
+        final Object target;
+        if (action == MotionEvent.ACTION_HOVER_EXIT) {
+            target = null;
+        } else {
+            Object w = WindowOverlayStack.isEmpty() ? null : WindowOverlayStack.hoverWindowAt(px, contentY);
+            target = w == null ? a : (w == WindowOverlayStack.HOVER_SWALLOWED ? null : w);
+        }
+        final Object old = s_hoverWindow;
+        if (old != null && old != target) {
+            sendHover(old, a, MotionEvent.ACTION_HOVER_EXIT, buttonState, meta, px, py, contentY);
+        }
+        s_hoverWindow = target;
+        if (target == null) return;
+        sendHover(target, a, old == target ? MotionEvent.ACTION_HOVER_MOVE : MotionEvent.ACTION_HOVER_ENTER,
+                buttonState, meta, px, py, contentY);
+    }
+
+    private static void sendHover(Object window, Activity a, int action, int buttonState, int meta,
+                                  float px, float py, float contentY) {
+        long t = android.os.SystemClock.uptimeMillis();
+        MotionEvent ev = mouseEvent(t, t, action, px, py, buttonState, meta);
+        try {
+            if (window == a) {
+                if (deliverToTakenInputQueue(a, ev)) return;
+                a.dispatchGenericMotionEvent(ev);
+            } else if (window instanceof View lv) {
+                WindowOverlayStack.deliverGenericToLayer(lv, ev, px, contentY);
+            }
+        } catch (Throwable thr) {
+            NativeLog.w(TAG, "hover delivery threw: " + thr);
+        }
+    }
+
+    private void sideButtonKeys(int changed, int keyAction, int meta) {
+        if ((changed & MotionEvent.BUTTON_BACK) != 0)
+            deliverKey(keyAction, KeyEvent.KEYCODE_BACK, 0, meta, false);
+        if ((changed & MotionEvent.BUTTON_FORWARD) != 0)
+            deliverKey(keyAction, KeyEvent.KEYCODE_FORWARD, 0, meta, false);
+    }
+
+    /** One BUTTON_PRESS / BUTTON_RELEASE, routed like a wheel step: the taken
+     *  native input queue if there is one, else the window under the pointer. */
+    private static void deliverMouseButton(int action, int actionButton, int buttonState,
+                                           int meta, float px, float py) {
+        final Activity a = ActivityHost.peek();
+        if (a == null) return;
+        long t = android.os.SystemClock.uptimeMillis();
+        long down = s_gestureDownTime != 0L ? s_gestureDownTime : t;
+        MotionEvent ev = mouseEvent(down, t, action, px, py, buttonState, meta);
+        ev.setActionButton(actionButton);
+        if (deliverToTakenInputQueue(a, ev)) return;
+        deliverWheelToWindows(a, ev);
     }
 
     public void dispatch(int action, float x, float y, float viewW, float viewH) {

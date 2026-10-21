@@ -407,6 +407,34 @@ public final class ClassFileRewriter {
                 }
             }
 
+            // ---- Pattern L -- libcore private-field names on HotSpot ----
+            // Apps reflect libcore's private fields by NAME; the host JDK names
+            // some of them differently (java.io.FileDescriptor: libcore
+            // `descriptor`, OpenJDK `fd`). Route the app's own
+            // Class.getDeclaredField(String) call sites through
+            // LibcoreFields.getDeclaredField(Class, String), which answers the
+            // libcore name with the host field and passes everything else
+            // through. invokevirtual -> invokestatic, both 3 bytes with the same
+            // stack effect (Class, String -> Field), so no PC / branch /
+            // StackMapTable shift. Rationale and the name table:
+            // LibcoreFields.java. Gate MACAPK_LIBCORE_FIELD_NAMES.
+            if (LIBCORE_FIELD_NAMES && containsNeedle(raw, NEEDLE_GET_DECLARED_FIELD)
+                    && containsNeedle(raw, NEEDLE_LIBCORE_FIELD)) {
+                int patchedL = 0;
+                for (MethodEntry m : cf.methods) {
+                    CodeAttr code = m.code;
+                    if (code == null) continue;
+                    patchedL += patternLLibcoreFieldNames(cf, code, className);
+                }
+                if (patchedL > 0) {
+                    if (DEBUG) {
+                        System.err.println("[rewriter] " + className + ": Pattern-L routed "
+                            + patchedL + " getDeclaredField call site(s) through LibcoreFields");
+                    }
+                    hits += patchedL;
+                }
+            }
+
             if (hits > 0) {
                 byte[] out = cf.serialize();
                 if (DEBUG) {
@@ -582,6 +610,12 @@ public final class ClassFileRewriter {
             }
             if (containsNeedle(raw, NEEDLE_RUN_FINALIZERS_ON_EXIT)
                 || containsNeedle(raw, FROM_BYTES_G)) {
+                return true;
+            }
+            // Pattern L: a getDeclaredField call AND a libcore field name
+            // literal in the same class (an over-match costs one parse).
+            if (LIBCORE_FIELD_NAMES && containsNeedle(raw, NEEDLE_GET_DECLARED_FIELD)
+                    && containsNeedle(raw, NEEDLE_LIBCORE_FIELD)) {
                 return true;
             }
             if (containsNeedle(raw, NEEDLE_CLINIT)
@@ -966,6 +1000,51 @@ public final class ClassFileRewriter {
             pc += len;
         }
         return repairs;
+    }
+
+    // -----------------------------------------------------------------
+    // Pattern L -- libcore private-field names (see LibcoreFields)
+    // -----------------------------------------------------------------
+
+    /** Gate for Pattern L (default ON); MACAPK_LIBCORE_FIELD_NAMES=0 leaves
+     *  every getDeclaredField call site alone. */
+    static final boolean LIBCORE_FIELD_NAMES =
+        !"0".equals(System.getenv("MACAPK_LIBCORE_FIELD_NAMES"));
+    private static final byte[] NEEDLE_GET_DECLARED_FIELD =
+        "getDeclaredField".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    /** The libcore field names LibcoreFields maps; any one is enough to parse. */
+    private static final byte[] NEEDLE_LIBCORE_FIELD =
+        "descriptor".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+    /** Rewrite every `invokevirtual java/lang/Class.getDeclaredField:
+     *  (Ljava/lang/String;)Ljava/lang/reflect/Field;` in one method into
+     *  `invokestatic com/macapk/loader/LibcoreFields.getDeclaredField:
+     *  (Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Field;`. */
+    private static int patternLLibcoreFieldNames(ClassFile cf, CodeAttr code, String className) {
+        int routed = 0;
+        int target = -1;
+        byte[] bc = code.code;
+        int codeEnd = code.codeOffset + code.codeLen;
+        int pc = code.codeOffset;
+        while (pc < codeEnd) {
+            int op = bc[pc] & 0xFF;
+            int len = instructionLength(op, bc, pc);
+            if (len <= 0) break;
+            if (op == OP_INVOKEVIRTUAL && isMethodref(cf, u2(bc, pc + 1), "java/lang/Class",
+                    "getDeclaredField", "(Ljava/lang/String;)Ljava/lang/reflect/Field;")) {
+                if (target < 0) {
+                    int cls = cf.findOrAddClass("com/macapk/loader/LibcoreFields");
+                    int nt = cf.findOrAddNameAndType("getDeclaredField",
+                        "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Field;");
+                    target = cf.findOrAddMethodref(cls, nt);
+                }
+                bc[pc] = (byte) OP_INVOKESTATIC;
+                writeU2(bc, pc + 1, target);
+                routed++;
+            }
+            pc += len;
+        }
+        return routed;
     }
 
     // -----------------------------------------------------------------
@@ -1591,6 +1670,56 @@ public final class ClassFileRewriter {
             return new String(raw, e.offset + 3, len, java.nio.charset.StandardCharsets.UTF_8);
         }
 
+        /** Find a CONSTANT_Utf8 equal to `v` (original or added) or append one. */
+        int findOrAddUtf8(String v) {
+            for (int i = 1; i < cpEntries.size(); ++i) {
+                CpEntry e = cpEntries.get(i);
+                if (e == null || e.tag != CP_UTF8) continue;
+                if (e.added ? v.equals(e.addedText) : v.equals(utf8(i))) return i;
+            }
+            byte[] b = v.getBytes(java.nio.charset.StandardCharsets.UTF_8);  // ASCII names only
+            byte[] entry = new byte[3 + b.length];
+            entry[0] = (byte) CP_UTF8;
+            writeU2(entry, 1, b.length);
+            System.arraycopy(b, 0, entry, 3, b.length);
+            CpEntry e = new CpEntry(CP_UTF8, -1, entry.length);
+            e.added = true; e.addedBytes = entry; e.addedText = v;
+            return append(e);
+        }
+        /** Find a CONSTANT_Class naming `internalName` or append one. */
+        int findOrAddClass(String internalName) {
+            for (int i = 1; i < cpEntries.size(); ++i) {
+                CpEntry e = cpEntries.get(i);
+                if (e == null || e.tag != CP_CLASS || e.added) continue;
+                if (internalName.equals(classNameOf(i))) return i;
+            }
+            int name = findOrAddUtf8(internalName);
+            byte[] entry = { (byte) CP_CLASS, (byte) (name >> 8), (byte) name };
+            CpEntry e = new CpEntry(CP_CLASS, -1, 3);
+            e.added = true; e.addedBytes = entry;
+            return append(e);
+        }
+        /** Append a CONSTANT_NameAndType for (name, descriptor). */
+        int findOrAddNameAndType(String name, String desc) {
+            int n = findOrAddUtf8(name), d = findOrAddUtf8(desc);
+            for (int i = 1; i < cpEntries.size(); ++i) {
+                CpEntry e = cpEntries.get(i);
+                if (e == null || e.tag != CP_NAMEANDTYPE || e.added) continue;
+                if (nameAndTypeName(i) == n && nameAndTypeDescriptor(i) == d) return i;
+            }
+            byte[] entry = { (byte) CP_NAMEANDTYPE, (byte) (n >> 8), (byte) n, (byte) (d >> 8), (byte) d };
+            CpEntry e = new CpEntry(CP_NAMEANDTYPE, -1, 5);
+            e.added = true; e.addedBytes = entry;
+            return append(e);
+        }
+        private int append(CpEntry e) {
+            int idx = cpEntries.size();
+            cpEntries.add(e);
+            cpAdded.add(e);
+            cpCount++;
+            return idx;
+        }
+
         /** Look up an existing Methodref with the given (class_idx,
          *  name_and_type_idx). If absent, append one. Returns the CP
          *  index of the (possibly newly-added) entry. */
@@ -1642,6 +1771,11 @@ public final class ClassFileRewriter {
             dst += cpEndOriginal - cpStart;
             // Added CP entries.
             for (CpEntry e : cpAdded) {
+                if (e.addedBytes != null) {
+                    System.arraycopy(e.addedBytes, 0, out, dst, e.addedBytes.length);
+                    dst += e.addedBytes.length;
+                    continue;
+                }
                 out[dst++] = (byte) e.tag;
                 writeU2(out, dst, e.addedClassIdx); dst += 2;
                 writeU2(out, dst, e.addedNtIdx);    dst += 2;
@@ -1659,6 +1793,9 @@ public final class ClassFileRewriter {
         boolean added;
         int addedClassIdx;
         int addedNtIdx;
+        /** For added Utf8 / Class / NameAndType entries: the whole entry. */
+        byte[] addedBytes;
+        String addedText;
         CpEntry(int tag, int offset, int size) {
             this.tag = tag; this.offset = offset; this.size = size;
         }

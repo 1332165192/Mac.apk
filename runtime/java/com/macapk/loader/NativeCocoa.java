@@ -273,6 +273,11 @@ public final class NativeCocoa {
      *  /system/fonts/ (android.graphics.MacApkSystemFonts). */
     public static native void setSystemFontsDir(String dir);
 
+    /** The file behind a host font's PostScript name, from CoreText, or null when
+     *  this Mac has no face by that exact name (host_fonts.cpp). Used for the CJK
+     *  families of that fonts.xml (android.graphics.MacApkHostFonts). */
+    public static native String hostFontFile(String postScriptName);
+
     /** Hand the shim the one shared volume path every app uses
      *  (SharedStorage.adoptCanonicalVolume): native /sdcard/... names it from
      *  here on, /sdcard/Android/{data,obb,media} still the app's own. */

@@ -213,14 +213,25 @@ public enum Quarantine {
 
 /// Every on-disk location the install system owns.
 ///
-/// `bundlesDir` is `/Applications` and not `~/Applications/Mac.apk Apps/`
-/// (which the master plan proposed): `~/Applications` does not exist on this
-/// machine at all, and the plan's own risk register (R3) doubted that the
-/// macOS 26 Spotlight Apps view -- which replaced Launchpad -- indexes
-/// subfolders. The owner's words are "inside of the Mac OS application
-/// files", so we use the one location that is unambiguously indexed. It is
-/// group-writable by admin on a stock install, but that is not guaranteed
-/// (MDM, a locked volume), which is what `bundlesDirIsWritable` is for.
+/// Generated bundles go in `/Applications` whenever this user can write it,
+/// and not in `~/Applications/Mac.apk Apps/` (which the master plan proposed):
+/// the plan's own risk register (R3) doubted that the macOS 26 Spotlight Apps
+/// view -- which replaced Launchpad -- indexes subfolders, and the owner's
+/// words are "inside of the Mac OS application files".
+///
+/// ⚠ GitHub #28 (v1.0.2282): `/Applications` is root:admin 775 on a stock
+/// macOS, so a STANDARD (non-admin) user cannot create anything in it. With
+/// `bundlesDir` a constant, every install by such a user failed staging with
+/// NSCocoaErrorDomain 513 ("You don't have permission to save the file
+/// 'MacOS' in the folder 'Contents'"), and there was nowhere else to put the
+/// app. Such a user falls back to the per-user `~/Applications` -- the folder
+/// macOS itself uses for a user's own apps, which Launch Services and the
+/// Spotlight Apps view both index (no subfolder, for the R3 reason above).
+/// `bundleDirs` lists both, and every reader that FINDS installed bundles
+/// (generator lookup and remove guard, reconcile adoption, bulk uninstall,
+/// the runtime's cross-app launcher and bundle watcher) scans both, so an
+/// app installed into either one is the same installed app. App data is in
+/// `appDataDir` either way.
 public enum Paths {
     public static let supportDir: URL = {
         let fm = FileManager.default
@@ -252,8 +263,113 @@ public enum Paths {
     /// rather than racing it. (Written by the launcher/stub, not by us.)
     public static let runDir = supportDir.appendingPathComponent("run", isDirectory: true)
 
-    /// Where per-app .app bundles are generated. See the note above.
-    public static let bundlesDir = URL(fileURLWithPath: "/Applications", isDirectory: true)
+    /// The system Applications folder: where a NEW bundle goes whenever this
+    /// user can write it. `MACAPK_SYSTEM_APPS_DIR` relocates it for a gate
+    /// (debug/bundlesdir_gate.sh points it at a read-only scratch folder to
+    /// play a standard user on an admin's Mac); the control panel unsets it
+    /// at startup, so it is a harness seam only.
+    public static var systemBundlesDir: URL {
+        if let e = ProcessInfo.processInfo.environment["MACAPK_SYSTEM_APPS_DIR"], !e.isEmpty {
+            return URL(fileURLWithPath: e, isDirectory: true)
+        }
+        return URL(fileURLWithPath: "/Applications", isDirectory: true)
+    }
+
+    /// The per-user `~/Applications`: where a NEW bundle goes when
+    /// `systemBundlesDir` is not writable (GitHub #28). `MACAPK_USER_APPS_DIR`
+    /// relocates it, like the one above.
+    public static var userBundlesDir: URL {
+        if let e = ProcessInfo.processInfo.environment["MACAPK_USER_APPS_DIR"], !e.isEmpty {
+            return URL(fileURLWithPath: e, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications", isDirectory: true)
+    }
+
+    /// Every folder an installed bundle may live in, in preference order.
+    /// Readers that look FOR installed bundles iterate this, never just
+    /// `bundlesDir`: a user whose access changed (made admin, or no longer)
+    /// still has apps in the other folder.
+    public static var bundleDirs: [URL] {
+        let a = systemBundlesDir, b = userBundlesDir
+        return a.standardizedFileURL.path == b.standardizedFileURL.path ? [a] : [a, b]
+    }
+
+    /// Where a NEW bundle is generated: `systemBundlesDir` when this user can
+    /// write it, else `userBundlesDir` (GitHub #28). An update regenerates an
+    /// existing bundle in whichever folder holds it
+    /// (`BundleGenerator.generate`), so this only decides where a first
+    /// install lands. Answers `systemBundlesDir` when neither is usable, so
+    /// the failure names the folder an admin would expect.
+    public static var bundlesDir: URL {
+        let sys = systemBundlesDir
+        if isWritableDir(sys) { return sys }
+        let user = userBundlesDir
+        if isWritableDir(user) { return user }
+        return sys
+    }
+
+    /// True when `url` is an existing directory this process can create
+    /// entries in. `isWritableFile` answers for the effective uid, which is
+    /// the question that matters -- /Applications is root-owned but
+    /// admin-group-writable on a stock macOS, and neither fact alone predicts
+    /// the answer.
+    static func isWritableDir(_ url: URL) -> Bool {
+        var isDir: ObjCBool = false
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue
+        else { return false }
+        return fm.isWritableFile(atPath: url.path)
+    }
+
+    /// Create `~/Applications` when this user cannot write `/Applications`
+    /// and it does not exist yet (a fresh account has none). Called by the
+    /// install paths before they generate; idempotent and best effort.
+    /// Never creates the system folder.
+    @discardableResult
+    public static func prepareBundlesDir() -> URL {
+        let sys = systemBundlesDir
+        if isWritableDir(sys) { return sys }
+        let user = userBundlesDir
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: user.path) {
+            do {
+                try fm.createDirectory(at: user, withIntermediateDirectories: true)
+                InstallLog.write("[install] \(sys.path) is not writable for this user; "
+                               + "created \(user.path) for app bundles")
+            } catch {
+                InstallLog.write("[install] could not create \(user.path): \(error)")
+            }
+        }
+        return bundlesDir
+    }
+
+    /// Our `.app` children of every bundle folder, folder by folder in
+    /// preference order and sorted by name within each, so a duplicate
+    /// resolves deterministically. Hidden entries (swap siblings) skipped.
+    /// Not filtered by identity: callers apply their own guard.
+    public static func bundleCandidates() -> [URL] {
+        let fm = FileManager.default
+        var out: [URL] = []
+        for d in bundleDirs {
+            guard let kids = try? fm.contentsOfDirectory(at: d, includingPropertiesForKeys: nil,
+                                                         options: [.skipsHiddenFiles])
+            else { continue }
+            out += kids.filter { $0.pathExtension == "app" }
+                       .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        }
+        return out
+    }
+
+    /// The bundle folder `url` sits directly inside, or nil when it is in
+    /// none of them. Resolves symlinks on both sides, as remove()'s guard does.
+    public static func bundleDir(containing url: URL) -> URL? {
+        let parent = url.resolvingSymlinksInPath().standardizedFileURL
+            .deletingLastPathComponent().path
+        return bundleDirs.first {
+            $0.resolvingSymlinksInPath().standardizedFileURL.path == parent
+        }
+    }
 
     /// Where each installed app's Android tree (its data) lives, one folder per
     /// app: `~/Library/Application Support/MacApk/<package>/`. A SIBLING of
@@ -276,8 +392,9 @@ public enum Paths {
     public static let installLockURL  = supportDir.appendingPathComponent("install.lock")
 
     /// Create the directories we own. Cheap and idempotent; call before any
-    /// write. Deliberately does NOT create `bundlesDir` (it is a system
-    /// location we do not own) or the support dir's parent.
+    /// write. Deliberately does NOT create a bundle folder (the system one is
+    /// not ours; `prepareBundlesDir` makes `~/Applications` only when an
+    /// install needs it) or the support dir's parent.
     @discardableResult
     public static func ensureDirectories() -> Bool {
         let fm = FileManager.default
@@ -289,17 +406,9 @@ public enum Paths {
         return ok
     }
 
-    /// True when we could actually write a bundle into `bundlesDir`.
-    /// `isWritableFile` answers for the effective uid, which is the question
-    /// that matters -- /Applications is root-owned but admin-group-writable
-    /// on a stock macOS, and neither fact alone predicts the answer.
-    public static var bundlesDirIsWritable: Bool {
-        var isDir: ObjCBool = false
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: bundlesDir.path, isDirectory: &isDir), isDir.boolValue
-        else { return false }
-        return fm.isWritableFile(atPath: bundlesDir.path)
-    }
+    /// True when we could actually write a bundle into `bundlesDir`, i.e.
+    /// into either folder (see `isWritableDir`).
+    public static var bundlesDirIsWritable: Bool { isWritableDir(bundlesDir) }
 }
 
 // MARK: - App data location (outside the bundle)
@@ -3624,6 +3733,9 @@ public final class InstallPipeline {
         // left the app extracted in a shared root with an empty bundle beside
         // it, and a shared copy that survived removing the bundle.
         var bundleURL: URL?
+        // A standard user cannot write /Applications; make sure the per-user
+        // folder exists before the writability test below (GitHub #28).
+        if hooks.generateBundle != nil { Paths.prepareBundlesDir() }
         if let gen = hooks.generateBundle, Paths.bundlesDirIsWritable,
            let pkg0 = peek.package, !pkg0.isEmpty {
             let ver0 = peek.versionName ?? ""
@@ -4579,10 +4691,10 @@ public final class InstallPipeline {
         /// `.app` bundles that will be removed. Every entry has passed the
         /// `org.macapk.app.` identifier guard.
         public var bundles: [String] = []
-        /// `.app` bundles under `bundlesDir` that carry our prefix but are
+        /// `.app` bundles in a bundle folder that carry our prefix but are
         /// refused anyway (belt and braces around the control panel).
         public var refusedBundles: [String] = []
-        /// Everything else under `bundlesDir`, counted not listed: these are
+        /// Everything else in the bundle folders, counted not listed: these are
         /// the user's own Mac apps and the number is the reassurance.
         public var untouchedBundleCount: Int = 0
         public var retainedApks: [String] = []
@@ -4603,10 +4715,10 @@ public final class InstallPipeline {
         // Bundles, including ones the registry never knew about (a row lost to
         // a crash, a hand-copied .app). "Remove all apps" that leaves a
         // launchable icon behind has not removed all apps.
-        if let kids = try? fm.contentsOfDirectory(at: Paths.bundlesDir,
-                                                  includingPropertiesForKeys: nil,
-                                                  options: [.skipsHiddenFiles]) {
-            for b in kids where b.pathExtension == "app" {
+        // Both bundle folders: an app installed while this user could not
+        // write /Applications lives in ~/Applications (GitHub #28).
+        do {
+            for b in Paths.bundleCandidates() {
                 // ⚠ THE ONE GUARD between a bug in this dialog and the user's
                 // /Applications. Only bundles WE generated carry this prefix.
                 guard let id = InstallPipeline.bundleIdentifier(of: b),
@@ -4702,13 +4814,10 @@ public final class InstallPipeline {
     /// what the user SEES, and a dialog that says "all your apps" without
     /// saying how many is not informed consent.
     public static func installedAppFootprint() -> (count: Int, bytes: Int64) {
-        let fm = FileManager.default
         var count = 0
         var bytes: Int64 = 0
-        if let kids = try? fm.contentsOfDirectory(at: Paths.bundlesDir,
-                                                  includingPropertiesForKeys: nil,
-                                                  options: [.skipsHiddenFiles]) {
-            for b in kids where b.pathExtension == "app" {
+        do {
+            for b in Paths.bundleCandidates() {
                 guard let id = bundleIdentifier(of: b), id.hasPrefix("org.macapk.app.")
                 else { continue }
                 count += 1
@@ -4726,7 +4835,7 @@ public final class InstallPipeline {
         public enum Problem: String {
             case bundleMissing      // the .app is gone; the user probably trashed it
             case bundleUnreachable  // could not tell -- unmounted volume, EACCES, ...
-            case bundleUnregistered // one of OUR .apps in /Applications with no row
+            case bundleUnregistered // one of OUR .apps in a bundle folder with no row
             case dataDirMissing     // extracted tree gone; app needs re-extraction
             case apkMissing         // no retained or original APK on disk
             case stuckInstalling    // interrupted install, now marked broken
@@ -4971,7 +5080,21 @@ public final class InstallPipeline {
         let record: AppRecord
     }
 
-    /// Scan `Paths.bundlesDir` for OUR bundles with no matching row.
+    /// Scan every bundle folder (`Paths.bundleDirs`) for OUR bundles with no
+    /// matching row. A dirName found in both folders is offered once, from
+    /// the preferred folder.
+    static func unregisteredBundles(knownTo reg: Registry) -> [UnregisteredBundle] {
+        var out: [UnregisteredBundle] = []
+        var seen = Set<String>()
+        for d in Paths.bundleDirs {
+            for u in unregisteredBundles(knownTo: reg, in: d) where seen.insert(u.dirName).inserted {
+                out.append(u)
+            }
+        }
+        return out
+    }
+
+    /// One bundle folder's share of the scan above.
     ///
     /// Four gates, all of which must pass before a bundle is adoptable, so a
     /// stray .app can never synthesise an "installed" answer:
@@ -4987,7 +5110,7 @@ public final class InstallPipeline {
     /// `in` is a parameter rather than a constant only so a gate can point it
     /// at a scratch directory. Product callers always take the default.
     static func unregisteredBundles(knownTo reg: Registry,
-                                    in bundlesDir: URL = Paths.bundlesDir) -> [UnregisteredBundle] {
+                                    in bundlesDir: URL) -> [UnregisteredBundle] {
         let fm = FileManager.default
         guard let kids = try? fm.contentsOfDirectory(at: bundlesDir,
                                                      includingPropertiesForKeys: nil,
