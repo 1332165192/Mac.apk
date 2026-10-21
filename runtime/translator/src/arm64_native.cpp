@@ -5232,6 +5232,10 @@ static void macapk_openal_stub_retired_note() {
             "docs/libopenal-alcopendevice-retired_2026-09-27.md)\n", v);
 }
 
+// Registered with the abort diagnostic in bionic_shim.cpp so a crash inside
+// this image logs as "libX.so+0xNNN" instead of a bare address.
+extern "C" void macapk_diag_note_guest_image(uintptr_t base, size_t span, const char* name);
+
 bool Image::load_common() {
     // MACAPK_LOAD_TIMING=1: wall time of every pass in this load, printed as
     // `[load-timing] <lib>: <pass> <ms>` for passes >= 2 ms. A boot-time
@@ -5252,6 +5256,7 @@ bool Image::load_common() {
     std::fprintf(stderr,
         "[arm64-native] %s: mapped, base=%p span=%zu\n",
         dbg_name_, (void*)base_, mapped_size_);
+    macapk_diag_note_guest_image((uintptr_t)base_, mapped_size_, dbg_name_);
     if (!parse_dynamic())                     return false;
     std::fprintf(stderr,
         "[arm64-native] %s: parsed dyn (rela=%zu pltrel=%zu init=%zu)\n",

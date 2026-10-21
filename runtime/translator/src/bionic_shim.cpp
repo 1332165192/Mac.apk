@@ -4065,6 +4065,48 @@ static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
 // the liblog path, reached through __android_log_assert / std::abort.
 static void macapk_liblog_write_line(const char* line, int n);
 static int macapk_diag_fd();
+// ---------------------------------------------------------------------------
+// Guest image table for the abort diagnostic below.
+//
+// backtrace_symbols_fd() can only name host images. An abort() raised inside
+// guest native code appears in the host backtrace as a bare address, because
+// our loader maps those ELF images itself and dyld knows nothing about them:
+// the log says "??? 0x48fc0c000+0x151cb4" and turning that into a file offset
+// needs a vmmap taken from the SAME run (ASLR moves every mapping on the next
+// one). The loader records each image's [base, base+span) here so the abort log
+// can print "libfoo.so+0x151cb4" next to the frame.
+//
+// Names are copied: an Image can be unloaded while the log still refers to it.
+// Later mappings win on lookup (a relayout re-registers under the same name).
+struct MacapkGuestImage {
+    uintptr_t base;
+    size_t    span;
+    char      name[96];
+};
+static MacapkGuestImage g_macapk_guest_images[512];
+static std::atomic<int> g_macapk_guest_image_count{0};
+
+extern "C" void macapk_diag_note_guest_image(uintptr_t base, size_t span, const char* name) {
+    if (!base || !span || !name || !*name) return;
+    const int i = g_macapk_guest_image_count.load(std::memory_order_relaxed);
+    if (i < 0 || i >= (int)(sizeof(g_macapk_guest_images) / sizeof(g_macapk_guest_images[0])))
+        return;
+    MacapkGuestImage& im = g_macapk_guest_images[i];
+    im.base = base;
+    im.span = span;
+    std::snprintf(im.name, sizeof(im.name), "%s", name);
+    g_macapk_guest_image_count.store(i + 1, std::memory_order_release);
+}
+
+static const MacapkGuestImage* macapk_diag_lookup_guest_image(uintptr_t addr) {
+    const int n = g_macapk_guest_image_count.load(std::memory_order_acquire);
+    for (int i = n - 1; i >= 0; --i) {
+        const MacapkGuestImage& im = g_macapk_guest_images[i];
+        if (addr >= im.base && addr < im.base + im.span) return &im;
+    }
+    return nullptr;
+}
+
 static void macapk_abort_log() {
     void* frames[64];
     int n = backtrace(frames, 64);
@@ -4075,6 +4117,19 @@ static void macapk_abort_log() {
     if (hn > 0) macapk_liblog_write_line(head, hn >= (int)sizeof(head) ? (int)sizeof(head) - 1 : hn);
     const int fd = macapk_diag_fd();
     backtrace_symbols_fd(frames, n, fd);
+    // Name the guest frames. backtrace_symbols_fd only resolves host images, so
+    // a crash inside guest native code otherwise prints as "??? 0x48fc0c000+...",
+    // which cannot be turned into a file offset without a vmmap from the same run.
+    for (int i = 0; i < n; ++i) {
+        const MacapkGuestImage* im = macapk_diag_lookup_guest_image((uintptr_t)frames[i]);
+        if (!im) continue;
+        char gline[224];
+        const int gn = std::snprintf(gline, sizeof(gline), "  [guest] #%-2d %p  %s+0x%zx\n",
+                                     i, frames[i], im->name,
+                                     (size_t)((uintptr_t)frames[i] - im->base));
+        if (gn > 0)
+            macapk_liblog_write_line(gline, gn >= (int)sizeof(gline) ? (int)sizeof(gline) - 1 : gn);
+    }
     static const char tail[] = "=== end backtrace; re-raising SIGABRT ===\n";
     macapk_liblog_write_line(tail, (int)sizeof(tail) - 1);
     if (fd == STDERR_FILENO) std::fflush(stderr);
