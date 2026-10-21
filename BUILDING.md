@@ -67,9 +67,10 @@ identity and notary settings from an untracked `scripts/.release.env` (start fro
 
 ## What's not in this repository
 
-- **Test tools and the app corpus.** The project's regression gates and its collection
-  of test APKs stay private. Test your change on the apps you care about, and say in
-  the pull request which ones.
+- **Private test tools and the app corpus.** The project's full regression gates
+  and its collection of test APKs stay private. Standalone public checks live in
+  `debug/`. Test your change on the apps you care about, and say in the pull
+  request which ones.
 - **pairip data files.** Official release builds bundle a few data files used by the
   pairip compatibility code (`lib/pairip-refs`). They are not part of this repository;
   without them a source build behaves the same except for apps that need them.
@@ -84,7 +85,24 @@ identity and notary settings from an untracked `scripts/.release.env` (start fro
 | `launcher/` | The SwiftUI control panel, the per-app stub and the install helper |
 | `thirdparty/` | ANGLE and MoltenVK patches and prebuilt libraries, license texts |
 | `scripts/` | Build, install and release scripts |
-| `debug/` | Only the helpers the build itself runs, and the GLES bridge generators |
+| `debug/` | Build helpers, GLES bridge generators and standalone framework regression checks |
 
 The DEX to JVM bytecode converter is also published on its own as
 [dex2jvm](https://github.com/kksimp/dex2jvm).
+
+## Canvas layer color filters
+
+`Canvas.saveLayer(bounds, paint)` snapshots the paint's color filter, filters the
+flattened group after paint-alpha modulation, then blends it onto the destination.
+This supports `PorterDuffColorFilter`, `BlendModeColorFilter`,
+`ColorMatrixColorFilter` and `LightingColorFilter`, including nested and recorded
+layers. Filtering is in-place within the saved clip's device bounds; filters that
+generate opacity from transparent pixels remain confined to the exact saved clip.
+
+Run the standalone pixel regression against the framework jar you built:
+
+```bash
+java -Djava.awt.headless=true -cp runtime/build/lib/android-framework.jar debug/LayerColorFilterTest.java
+MACAPK_FRAMESPEED_LAYER=0 java -Djava.awt.headless=true -cp runtime/build/lib/android-framework.jar debug/LayerColorFilterTest.java
+```
+
