@@ -90,6 +90,9 @@ public class Canvas {
         // the layer image came from (null = allocated the pre-change way).
         java.awt.Rectangle inkDev;
         LayerPool.Entry    pooled;
+        ColorFilter   colorFilter; // captured at saveLayer, applied once to the flattened pixels
+        java.awt.Composite filteredComposite; // destination blend, without paint alpha
+        Shape         filterClipDev; // exact initial clip: filters can make transparent pixels opaque
     }
     private static final Layer NO_LAYER = new Layer();
 
@@ -525,8 +528,15 @@ public class Canvas {
                 // path left it null.
                 pg.setClip(layer.awtRule != AlphaComposite.SRC_OVER ? layer.clipDev
                            : (SAVE_CLIP ? layer.inkDev : null));
-                pg.setComposite(AlphaComposite.getInstance(
-                        layer.awtRule, Math.max(0f, Math.min(1f, layer.alpha))));
+                if (layer.colorFilter != null) {
+                    macapkMarkInk();
+                    filterLayerPixels(layer);
+                    pg.setClip(layer.filterClipDev);
+                    pg.setComposite(layer.filteredComposite);
+                } else {
+                    pg.setComposite(AlphaComposite.getInstance(
+                            layer.awtRule, Math.max(0f, Math.min(1f, layer.alpha))));
+                }
                 pg.drawImage(layer.layerImage, 0, 0, null);
                 pg.setComposite(oldComp);
                 // The layer's pixels are consumed; recycle its image. The ink box
@@ -596,14 +606,9 @@ public class Canvas {
     public int saveLayerAlpha(RectF bounds, int alpha, int saveFlags) {
         return saveLayerAlpha(bounds, alpha);
     }
-    /** AOSP Canvas.saveLayer(bounds, paint): the layer alpha comes from the
-     *  paint's alpha (null paint == fully opaque == a plain save). The paint's
-     *  PorterDuff xfermode (if any) selects the composite RULE blended back at
-     *  restore() -- SRC_OVER ordinarily, DST_IN/DST_OUT/SRC_IN/... for Lottie
-     *  mattes/masks. A non-SRC_OVER rule REQUIRES the saveLayer bounds (so the
-     *  composite is clipped to the matte region, not the whole canvas); when the
-     *  bounds are missing/degenerate it falls back to SRC_OVER. (color-filter
-     *  still ignored.) */
+    /** Save a flattened group. Paint alpha modulates its pixels BEFORE the color filter;
+     *  the filtered result is then blended onto the parent. Capture the filter now, not
+     *  at restore: callers may mutate both the Paint and mutable filter objects. */
     public int saveLayer(float l, float t, float r, float b, Paint paint) {
         int a = (paint != null) ? paint.getAlpha() : 255;
         // v1.0.500: a saveLayer() with explicit bounds + a paint FORCES a real
@@ -617,8 +622,26 @@ public class Canvas {
         // clearCanvas wipe only that offscreen; on restore it composites
         // SRC_OVER and leaves the rest of the frame intact. saveLayerAlpha()
         // (View group-opacity, no clearCanvas) keeps the optimization.
-        boolean forceLayer = (r > l && b > t);
-        return pushLayer(Math.max(0, Math.min(255, a)) / 255f, awtRuleForPaint(paint), l, t, r, b, forceLayer);
+        ColorFilter filter = paint == null ? null : MacApkDisplayList.snap(paint.getColorFilter());
+        boolean forceLayer = (r > l && b > t) || filter != null;
+        int count = pushLayer(Math.max(0, Math.min(255, a)) / 255f,
+                awtRuleForPaint(paint), l, t, r, b, forceLayer);
+        if (filter != null && g != null && image != null) {
+            Layer layer = layerStack.peek();
+            layer.colorFilter = filter;
+            java.awt.Composite composite = bitmapRuleFor(paint);
+            layer.filteredComposite = composite == null ? AlphaComposite.SrcOver : composite;
+            Shape clip = g.getClip();
+            layer.filterClipDev = clip == null
+                    ? new java.awt.Rectangle(0, 0, image.getWidth(), image.getHeight())
+                    : g.getTransform().createTransformedShape(clip);
+            // Required even with pooling disabled. Only pixels in the initial layer clip
+            // can contribute; a filter with alpha bias must not fill the rest of the canvas.
+            if (layer.inkDev == null) {
+                layer.inkDev = macapkLayerInkBounds(g, image.getWidth(), image.getHeight());
+            }
+        }
+        return count;
     }
     public int saveLayer(RectF bounds, Paint paint) {
         if (bounds == null) return saveLayer(0, 0, 0, 0, paint);
@@ -4745,20 +4768,23 @@ public class Canvas {
     private BufferedImage filterPixels(int[] in, int w, int h, ColorFilter cf, int preAlpha) {
         BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
         int[] o = ((java.awt.image.DataBufferInt) out.getRaster().getDataBuffer()).getData();
-        final int n = w * h;
+        filterPixels(in, o, 0, w * h, cf, preAlpha);
+        return out;
+    }
+    /** Also used in place by saveLayer; no second canvas-sized filtered image. */
+    private void filterPixels(int[] in, int[] out, int start, int end, ColorFilter cf, int preAlpha) {
         final boolean pre = preAlpha < 255;
         if (cf instanceof PorterDuffColorFilter f) {
-            final PorterDuff.Mode m = f.getMode();
+            final BlendMode m = filterBlendMode(f.getMode());
             final int c = f.getColor();
-            for (int i = 0; i < n; i++) o[i] = pdfPixel(m, c, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
+            for (int i = start; i < end; i++) out[i] = blendPixel(m, c, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
         } else if (cf instanceof BlendModeColorFilter f) {
             final BlendMode m = f.getMode();
             final int c = f.getColor();
-            for (int i = 0; i < n; i++) o[i] = blendPixel(m, c, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
+            for (int i = start; i < end; i++) out[i] = blendPixel(m, c, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
         } else {
-            for (int i = 0; i < n; i++) o[i] = filterPixel(cf, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
+            for (int i = start; i < end; i++) out[i] = filterPixel(cf, pre ? scaleAlpha(in[i], preAlpha) : in[i]);
         }
-        return out;
     }
     private int filterPixel(ColorFilter cf, int pixel) {
         if (cf instanceof PorterDuffColorFilter) {
@@ -4780,34 +4806,137 @@ public class Canvas {
     }
     // Skia color-filter semantics: filter color is "src", pixel is "dst".
     private static int pdfPixel(PorterDuff.Mode m, int color, int pixel) {
-        if (m == null) return recolorPixel(color, pixel);
-        switch (m) {
-            case SRC:                return color;
-            case SRC_IN: case SRC_ATOP: return recolorPixel(color, pixel);
-            case DST: case DST_IN: case DST_OUT: case DST_ATOP: case DST_OVER: return pixel;
-            case MULTIPLY:           return multiplyColors(color, pixel);
-            case SCREEN:             return screenColors(color, pixel);
-            case ADD:                return addColors(color, pixel);
-            case CLEAR:              return 0;
-            default:                 return recolorPixel(color, pixel);
-        }
+        return blendPixel(filterBlendMode(m), color, pixel);
+    }
+    private static BlendMode filterBlendMode(PorterDuff.Mode m) {
+        if (m == null) return null;
+        // Android's legacy MULTIPLY is Skia MODULATE, not the newer blend MULTIPLY.
+        return switch (m) {
+            case MULTIPLY -> BlendMode.MODULATE;
+            case ADD -> BlendMode.PLUS;
+            case CLEAR -> BlendMode.CLEAR;
+            case SRC -> BlendMode.SRC;
+            case DST -> BlendMode.DST;
+            case SRC_OVER -> BlendMode.SRC_OVER;
+            case DST_OVER -> BlendMode.DST_OVER;
+            case SRC_IN -> BlendMode.SRC_IN;
+            case DST_IN -> BlendMode.DST_IN;
+            case SRC_OUT -> BlendMode.SRC_OUT;
+            case DST_OUT -> BlendMode.DST_OUT;
+            case SRC_ATOP -> BlendMode.SRC_ATOP;
+            case DST_ATOP -> BlendMode.DST_ATOP;
+            case XOR -> BlendMode.XOR;
+            case SCREEN -> BlendMode.SCREEN;
+            case OVERLAY -> BlendMode.OVERLAY;
+            case DARKEN -> BlendMode.DARKEN;
+            case LIGHTEN -> BlendMode.LIGHTEN;
+        };
     }
     private static int blendPixel(BlendMode m, int color, int pixel) {
-        if (m == null) return recolorPixel(color, pixel);
-        if (m == BlendMode.SRC) return color;
-        if (m == BlendMode.SRC_IN || m == BlendMode.SRC_ATOP) return recolorPixel(color, pixel);
-        if (m == BlendMode.DST || m == BlendMode.DST_IN || m == BlendMode.DST_OUT || m == BlendMode.DST_ATOP || m == BlendMode.DST_OVER) return pixel;
-        if (m == BlendMode.MODULATE || m == BlendMode.MULTIPLY) return multiplyColors(color, pixel);
-        if (m == BlendMode.SCREEN) return screenColors(color, pixel);
-        if (m == BlendMode.PLUS)   return addColors(color, pixel);
-        if (m == BlendMode.CLEAR)  return 0;
-        return recolorPixel(color, pixel);
+        if (m == null || m == BlendMode.SRC_IN) return recolorPixel(color, pixel);
+        if (m == BlendMode.CLEAR) return 0;
+        if (m == BlendMode.SRC) return (color >>> 24) == 0 ? 0 : color;
+        if (m == BlendMode.DST) return pixel;
+        float sa = (color >>> 24) / 255f, da = (pixel >>> 24) / 255f;
+        float sr = ((color >>> 16) & 255) / 255f, sg = ((color >>> 8) & 255) / 255f,
+              sb = (color & 255) / 255f;
+        float dr = ((pixel >>> 16) & 255) / 255f, dg = ((pixel >>> 8) & 255) / 255f,
+              db = (pixel & 255) / 255f;
+        float sf, df;
+        switch (m) {
+            case SRC_OVER: sf = 1f; df = 1f - sa; break;
+            case DST_OVER: sf = 1f - da; df = 1f; break;
+            case DST_IN: sf = 0f; df = sa; break;
+            case SRC_OUT: sf = 1f - da; df = 0f; break;
+            case DST_OUT: sf = 0f; df = 1f - sa; break;
+            case SRC_ATOP: sf = da; df = 1f - sa; break;
+            case DST_ATOP: sf = 1f - da; df = sa; break;
+            case XOR: sf = 1f - da; df = 1f - sa; break;
+            default: return blendFilterColor(m, sa, sr, sg, sb, da, dr, dg, db);
+        }
+        float a = sa * sf + da * df;
+        return packFilterColor(a, sa * sr * sf + da * dr * df,
+                sa * sg * sf + da * dg * df, sa * sb * sf + da * db * df);
     }
-    /** Recolor a pixel to the filter RGB, keeping alpha = pixelAlpha*filterAlpha
-     *  (the classic SRC_IN "tint an icon" result). */
+    private static int blendFilterColor(BlendMode mode, float sa, float sr, float sg, float sb,
+            float da, float dr, float dg, float db) {
+        if (mode == BlendMode.PLUS) {
+            return packFilterColor(Math.min(1f, sa + da), Math.min(1f, sa * sr + da * dr),
+                    Math.min(1f, sa * sg + da * dg), Math.min(1f, sa * sb + da * db));
+        }
+        if (mode == BlendMode.MODULATE) {
+            return packFilterColor(sa * da, sa * da * sr * dr, sa * da * sg * dg, sa * da * sb * db);
+        }
+        int blend = switch (mode) {
+            case SCREEN -> BlendComposite.B_SCREEN;
+            case OVERLAY -> BlendComposite.B_OVERLAY;
+            case DARKEN -> BlendComposite.B_DARKEN;
+            case LIGHTEN -> BlendComposite.B_LIGHTEN;
+            case COLOR_DODGE -> BlendComposite.B_COLOR_DODGE;
+            case COLOR_BURN -> BlendComposite.B_COLOR_BURN;
+            case HARD_LIGHT -> BlendComposite.B_HARD_LIGHT;
+            case SOFT_LIGHT -> BlendComposite.B_SOFT_LIGHT;
+            case DIFFERENCE -> BlendComposite.B_DIFFERENCE;
+            case EXCLUSION -> BlendComposite.B_EXCLUSION;
+            case MULTIPLY -> BlendComposite.B_MULTIPLY;
+            default -> -1;
+        };
+        float br, bg, bb;
+        if (blend >= 0) {
+            br = BlendComposite.blend(blend, sr, dr);
+            bg = BlendComposite.blend(blend, sg, dg);
+            bb = BlendComposite.blend(blend, sb, db);
+        } else {
+            // W3C non-separable modes: SetSat followed by SetLum/ClipColor.
+            boolean sourceHue = mode == BlendMode.HUE || mode == BlendMode.COLOR;
+            br = sourceHue ? sr : dr;
+            bg = sourceHue ? sg : dg;
+            bb = sourceHue ? sb : db;
+            float lum = mode == BlendMode.LUMINOSITY
+                    ? 0.3f * sr + 0.59f * sg + 0.11f * sb
+                    : 0.3f * dr + 0.59f * dg + 0.11f * db;
+            if (mode == BlendMode.HUE || mode == BlendMode.SATURATION) {
+                float sat = mode == BlendMode.HUE
+                        ? Math.max(dr, Math.max(dg, db)) - Math.min(dr, Math.min(dg, db))
+                        : Math.max(sr, Math.max(sg, sb)) - Math.min(sr, Math.min(sg, sb));
+                float min = Math.min(br, Math.min(bg, bb));
+                float range = Math.max(br, Math.max(bg, bb)) - min;
+                float scale = range > 0f ? sat / range : 0f;
+                br = (br - min) * scale; bg = (bg - min) * scale; bb = (bb - min) * scale;
+            }
+            float delta = lum - (0.3f * br + 0.59f * bg + 0.11f * bb);
+            br += delta; bg += delta; bb += delta;
+            float min = Math.min(br, Math.min(bg, bb));
+            float max = Math.max(br, Math.max(bg, bb));
+            if (min < 0f) {
+                float scale = lum / (lum - min);
+                br = lum + (br - lum) * scale;
+                bg = lum + (bg - lum) * scale;
+                bb = lum + (bb - lum) * scale;
+            }
+            if (max > 1f) {
+                float scale = (1f - lum) / (max - lum);
+                br = lum + (br - lum) * scale;
+                bg = lum + (bg - lum) * scale;
+                bb = lum + (bb - lum) * scale;
+            }
+        }
+        float overlap = sa * da;
+        return packFilterColor(sa + da * (1f - sa),
+                (1f - da) * sa * sr + (1f - sa) * da * dr + overlap * br,
+                (1f - da) * sa * sg + (1f - sa) * da * dg + overlap * bg,
+                (1f - da) * sa * sb + (1f - sa) * da * db + overlap * bb);
+    }
+    /** Premultiplied blend result to the layer's straight ARGB storage. */
+    private static int packFilterColor(float a, float r, float g, float b) {
+        if (a <= 0f) return 0;
+        return (clamp255(a * 255f) << 24) | (clamp255(r * 255f / a) << 16)
+                | (clamp255(g * 255f / a) << 8) | clamp255(b * 255f / a);
+    }
+    /** SRC_IN tint, preserving coverage with rounded alpha multiplication. */
     private static int recolorPixel(int color, int pixel) {
-        int pa = (pixel >>> 24) & 0xff, ca = (color >>> 24) & 0xff;
-        return ((pa * ca / 255) << 24) | (color & 0x00FFFFFF);
+        int alpha = ((pixel >>> 24) * (color >>> 24) + 127) / 255;
+        return alpha == 0 ? 0 : (alpha << 24) | (color & 0x00FFFFFF);
     }
     private static int multiplyColors(int a, int b) {
         int aa=(a>>>24)&0xff, ar=(a>>16)&0xff, ag=(a>>8)&0xff, ab=a&0xff;
@@ -4830,18 +4959,20 @@ public class Canvas {
         int mr=(mul>>16)&0xff, mg=(mul>>8)&0xff, mb=mul&0xff;
         int ar=(add>>16)&0xff, ag=(add>>8)&0xff, ab=add&0xff;
         return (sa<<24)
-            | (Math.min(255, sr*mr/255 + ar) << 16)
-            | (Math.min(255, sg*mg/255 + ag) << 8)
-            |  Math.min(255, sb*mb/255 + ab);
+            | (Math.min(255, (sr*mr + 127)/255 + ar) << 16)
+            | (Math.min(255, (sg*mg + 127)/255 + ag) << 8)
+            |  Math.min(255, (sb*mb + 127)/255 + ab);
     }
     private static int applyColorMatrix(int argb, float[] m) {
         if (m == null || m.length < 20) return argb;
         float a=(argb>>>24)&0xff, r=(argb>>16)&0xff, gg=(argb>>8)&0xff, b=argb&0xff;
+        // Skia unpremultiplies before the matrix: at alpha zero there is no hidden RGB.
+        if (a == 0f) r = gg = b = 0f;
         int nr=clamp255(m[0]*r  + m[1]*gg  + m[2]*b  + m[3]*a  + m[4]);
         int ng=clamp255(m[5]*r  + m[6]*gg  + m[7]*b  + m[8]*a  + m[9]);
         int nb=clamp255(m[10]*r + m[11]*gg + m[12]*b + m[13]*a + m[14]);
         int na=clamp255(m[15]*r + m[16]*gg + m[17]*b + m[18]*a + m[19]);
-        return (na<<24)|(nr<<16)|(ng<<8)|nb;
+        return na == 0 ? 0 : (na<<24)|(nr<<16)|(ng<<8)|nb;
     }
     private static int clamp255(float v) { int i=(int)(v+0.5f); return i<0?0:(i>255?255:i); }
 
@@ -5688,7 +5819,7 @@ public class Canvas {
             case XOR:      return AlphaComposite.Xor;
             case DARKEN:   return BlendComposite.DARKEN;
             case LIGHTEN:  return BlendComposite.LIGHTEN;
-            case MULTIPLY: return BlendComposite.MULTIPLY;
+            case MULTIPLY: return BlendComposite.MODULATE;
             case SCREEN:   return BlendComposite.SCREEN;
             case ADD:      return BlendComposite.PLUS;
             case OVERLAY:  return BlendComposite.OVERLAY;
@@ -6264,6 +6395,22 @@ public class Canvas {
     public boolean clipRegion(android.graphics.Region region, android.graphics.Region.Op op) { return false; }
     public long getNativeCanvasWrapper() { return 0L; }
     public void setScreenDensity(int density) { }
+
+    /** Filter the private layer buffer in place, only inside its device bounding box.
+     *  The exact clip is applied on composite, including nonrectangular/rotated clips.
+     *  Pool release uses the same box, so generated pixels cannot leak on reuse. */
+    private void filterLayerPixels(Layer layer) {
+        int[] pixels = ((java.awt.image.DataBufferInt) layer.layerImage.getRaster()
+                .getDataBuffer()).getData();
+        int stride = layer.layerImage.getWidth();
+        java.awt.Rectangle box = layer.inkDev;
+        int alpha = Math.round(layer.alpha * 255f);
+        for (int y = box.y; y < box.y + box.height; y++) {
+            int start = y * stride + box.x;
+            filterPixels(pixels, pixels, start, start + box.width, layer.colorFilter, alpha);
+        }
+    }
+
 }
 
 
