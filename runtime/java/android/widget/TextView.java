@@ -109,6 +109,16 @@ public class TextView extends View
     private String macapkCursorDrawableAttr;
     private boolean macapkCursorDrawableResolved;
 
+    /** The view's OWN android:textSelectHandle / Left / Right, as written (null
+     *  when the XML/style says nothing: the getters then ask the theme, as
+     *  AOSP's obtainStyledAttributes falls back to it). */
+    private String macapkSelectHandleAttr, macapkSelectHandleLeftAttr, macapkSelectHandleRightAttr;
+    private boolean macapkSelectHandleResolved, macapkSelectHandleLeftResolved, macapkSelectHandleRightResolved;
+
+    private static String macapkNonEmpty(String v) {
+        return v == null || v.isEmpty() ? null : v;
+    }
+
     /** AOSP TextView.mCursorVisibleFromAttr (:12097-12125 backing field). */
     private boolean mCursorVisibleFromAttr = true;
 
@@ -117,6 +127,13 @@ public class TextView extends View
      *  TextView_textCursorDrawable (:1504-1506), TextView_editable
      *  (:1259-1260), and the editable branch creating the Editor. */
     private void macapkInitCaret(android.util.AttributeSet a) {
+        if (a != null) {
+            try {
+                macapkSelectHandleAttr = macapkNonEmpty(a.getAttributeValue(MACAPK_ANDROID_NS, "textSelectHandle"));
+                macapkSelectHandleLeftAttr = macapkNonEmpty(a.getAttributeValue(MACAPK_ANDROID_NS, "textSelectHandleLeft"));
+                macapkSelectHandleRightAttr = macapkNonEmpty(a.getAttributeValue(MACAPK_ANDROID_NS, "textSelectHandleRight"));
+            } catch (Throwable ignored) {}
+        }
         if (!MACAPK_TEXT_CARET) return;
         boolean editableAttrFalse = false;
         if (a != null) {
@@ -6685,13 +6702,25 @@ public class TextView extends View
     }
     /** AOSP TextView.getTextSelectHandle() (TextView.java:3649-3654): lazily
      *  resolves mTextSelectHandleRes into a Drawable on first read and caches
-     *  it. Returns null until a setter above has run at least once -- the
-     *  same branch AOSP itself takes whenever the res id is still its zero
-     *  default, which is always here since this tree does not parse the
-     *  android:textSelectHandle theme attribute during inflation. */
+     *  it. AOSP's constructor fills mTextSelectHandleRes from
+     *  TextView_textSelectHandle, i.e. the view's XML/style, else the THEME
+     *  (Theme.Material and every AppCompat/MaterialComponents theme on it:
+     *  @drawable/text_select_handle_middle_material), so on a device the
+     *  getter is non-null for any themed TextView. That theme value is
+     *  resolved lazily here, once, the way getTextCursorDrawable does it.
+     *  React Native's ReactTextInputManager.setSelectionHandleColor does
+     *  checkNotNull(view.textSelectHandle) on API 29+; a null here threw
+     *  inside RN's UI-operation frame, which puts its UIManager in an illegal
+     *  state and drops every later UI update (Xbox: taps did nothing). */
     public android.graphics.drawable.Drawable getTextSelectHandle() {
         if (mTextSelectHandle == null && mTextSelectHandleRes != 0) {
             mTextSelectHandle = getContext().getDrawable(mTextSelectHandleRes);
+        } else if (mTextSelectHandle == null && !macapkSelectHandleResolved) {
+            macapkSelectHandleResolved = true;
+            int[] id = new int[1];
+            try { mTextSelectHandle = macapkResolveAttrDrawable(macapkSelectHandleAttr, "android:textSelectHandle", id); }
+            catch (Throwable ignored) {}
+            if (id[0] != 0) mTextSelectHandleRes = id[0];
         }
         return mTextSelectHandle;
     }
@@ -6716,6 +6745,12 @@ public class TextView extends View
     public android.graphics.drawable.Drawable getTextSelectHandleLeft() {
         if (mTextSelectHandleLeft == null && mTextSelectHandleLeftRes != 0) {
             mTextSelectHandleLeft = getContext().getDrawable(mTextSelectHandleLeftRes);
+        } else if (mTextSelectHandleLeft == null && !macapkSelectHandleLeftResolved) {
+            macapkSelectHandleLeftResolved = true;
+            int[] id = new int[1];
+            try { mTextSelectHandleLeft = macapkResolveAttrDrawable(macapkSelectHandleLeftAttr, "android:textSelectHandleLeft", id); }
+            catch (Throwable ignored) {}
+            if (id[0] != 0) mTextSelectHandleLeftRes = id[0];
         }
         return mTextSelectHandleLeft;
     }
@@ -6740,6 +6775,12 @@ public class TextView extends View
     public android.graphics.drawable.Drawable getTextSelectHandleRight() {
         if (mTextSelectHandleRight == null && mTextSelectHandleRightRes != 0) {
             mTextSelectHandleRight = getContext().getDrawable(mTextSelectHandleRightRes);
+        } else if (mTextSelectHandleRight == null && !macapkSelectHandleRightResolved) {
+            macapkSelectHandleRightResolved = true;
+            int[] id = new int[1];
+            try { mTextSelectHandleRight = macapkResolveAttrDrawable(macapkSelectHandleRightAttr, "android:textSelectHandleRight", id); }
+            catch (Throwable ignored) {}
+            if (id[0] != 0) mTextSelectHandleRightRes = id[0];
         }
         return mTextSelectHandleRight;
     }
@@ -6763,7 +6804,7 @@ public class TextView extends View
     private android.graphics.drawable.Drawable mCursorDrawable;
     /** AOSP mCursorDrawableRes (:981), an APP drawable id. A FRAMEWORK drawable
      *  has no id in this tree and is resolved by name instead (see
-     *  macapkResolveCursorDrawable). Field NAME kept: apps reflect on it. */
+     *  macapkResolveAttrDrawable). Field NAME kept: apps reflect on it. */
     int mCursorDrawableRes;
     /** AOSP :4009-4015. The Editor's copy is loaded once and not replaced, as
      *  on a device. */
@@ -6794,27 +6835,33 @@ public class TextView extends View
                 catch (Throwable ignored) {}
             } else if (!macapkCursorDrawableResolved) {
                 macapkCursorDrawableResolved = true;
-                try { mCursorDrawable = macapkResolveCursorDrawable(); }
+                try {
+                    int[] id = new int[1];
+                    mCursorDrawable = macapkResolveAttrDrawable(macapkCursorDrawableAttr,
+                            "android:textCursorDrawable", id);
+                    if (id[0] != 0) mCursorDrawableRes = id[0];
+                }
                 catch (Throwable ignored) {}
             }
         }
         return mCursorDrawable;
     }
 
-    /** The view's android:textCursorDrawable, else the theme's, as a Drawable.
-     *  An APP reference resolves to its id (and fills mCursorDrawableRes, as the
-     *  AOSP constructor would have). A FRAMEWORK reference -- the Material
-     *  default, `@android:drawable/text_cursor_material`, measured as the
+    /** A TextView drawable attribute (textCursorDrawable, textSelectHandle*):
+     *  the view's own value `ref`, else the theme's `themeAttr`, as a Drawable.
+     *  An APP reference resolves to its id, returned in outRes[0] for the
+     *  caller's mXxxRes field, as the AOSP constructor would have filled it.
+     *  A FRAMEWORK reference -- the Material default, `@android:drawable/text_cursor_material`, measured as the
      *  resolved theme value for both Google Calculator (Theme.Legacy.Calculator)
      *  and OpenCalculator (AppTheme) -- goes to Resources' framework-drawable
      *  table (text_cursor_material itself excepted, see below). */
-    private android.graphics.drawable.Drawable macapkResolveCursorDrawable() {
-        String ref = macapkCursorDrawableAttr;
+    private android.graphics.drawable.Drawable macapkResolveAttrDrawable(String ref, String themeAttr,
+                                                                          int[] outRes) {
         final Context c = getContext();
         if (c == null) return null;
         if (ref == null) {
             android.content.res.Resources.Theme t = c.getTheme();
-            if (t != null) ref = t.resolveAttrRaw("android:textCursorDrawable");
+            if (t != null) ref = t.resolveAttrRaw(themeAttr);
         }
         if (ref == null) return null;
         ref = ref.trim();
@@ -6829,7 +6876,7 @@ public class TextView extends View
                 int id = num.startsWith("0x") ? (int) Long.parseLong(num.substring(2), 16)
                                                : (int) Long.parseLong(num);
                 if (id != 0) {
-                    mCursorDrawableRes = id;
+                    outRes[0] = id;
                     return c.getDrawable(id);
                 }
             } catch (Throwable ignored) {}
@@ -6841,7 +6888,7 @@ public class TextView extends View
             try { id = res.getIdentifier(name, "drawable", c.getPackageName()); }
             catch (Throwable ignored) {}
             if (id != 0) {
-                mCursorDrawableRes = id;
+                outRes[0] = id;
                 return c.getDrawable(id);
             }
             // An unqualified name the APP table lacks came out of a FRAMEWORK
@@ -6874,7 +6921,7 @@ public class TextView extends View
      *  getDimensionPixelOffset (truncate). Fallback colour: Theme.Material.Light's
      *  colorAccent, material_deep_teal_500 #009688 (colors_material.xml).
      *  REMOVAL CONDITION: delete this (and the name check that routes to it in
-     *  macapkResolveCursorDrawable) once the platform-table copy of
+     *  macapkResolveAttrDrawable) once the platform-table copy of
      *  text_cursor_material carries its tint -- the drawable inflater reading
      *  <shape android:tint> and applying it SRC_IN, as AOSP's GradientDrawable
      *  does. Until then the table copy is a WHITE bar. */
