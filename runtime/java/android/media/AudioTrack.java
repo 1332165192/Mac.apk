@@ -72,6 +72,10 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     // getBufferSizeInFrames disagree the way they do on a real device.
     private final int bufferSizeInFrames;
     private int effectiveBufferInFrames;
+    // The native track's frameCount: bufferSizeInFrames raised to the
+    // platform minimum (see the constructor). bufferSizeInFrames stays the
+    // app's request, which is what bounds a MODE_STATIC buffer.
+    private int capacityInFrames;
     // AOSP's mDataLoadMode. Recorded because setPlaybackHeadPosition's very
     // first branch is `if (mDataLoadMode == MODE_STREAM || ...) return
     // ERROR_INVALID_OPERATION` -- without the field there is nothing to be
@@ -144,6 +148,22 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
             h = 0;
         }
         this.handle = h;
+        // AOSP: the track's frameCount is the request raised to the platform
+        // minimum (AudioFlinger PlaybackThread::createTrack_l), and both
+        // getBufferCapacityInFrames and the initial getBufferSizeInFrames
+        // report it. The native side owns that answer; an older backend (or a
+        // test double) without the method leaves the request as the answer.
+        int cap = bufFrames;
+        if (h != 0) {
+            try {
+                int c = com.macapk.loader.NativeAudio.nativeGetBufferCapacity(h);
+                if (c > 0) cap = c;
+            } catch (Throwable t) {
+                // keep the request
+            }
+        }
+        this.capacityInFrames = cap;
+        this.effectiveBufferInFrames = cap;
     }
 
     private static int normalizeEncoding(int fmt) {
@@ -201,11 +221,11 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     public int getSampleRate()      { return sampleRate; }
     public int getChannelCount()    { return channels; }
     public int getAudioFormat()     { return encoding; }
-    // The actual allocated buffer size, computed once at construction from
-    // bufferSizeInBytes. AOSP's getBufferSizeInFrames() calls through to a
-    // native query that can reflect a post-creation route adjustment; Mac.apk
-    // has no HAL that resizes the buffer after creation, so the construction-
-    // time value is always the current value.
+    // The fill threshold: the native frameCount at construction, then
+    // whatever setBufferSizeInFrames adopted. AOSP's getBufferSizeInFrames()
+    // calls through to a native query that can reflect a post-creation route
+    // adjustment; Mac.apk has no HAL that resizes the buffer behind the app's
+    // back, so the last adopted value is always the current value.
     public int getBufferSizeInFrames() { return effectiveBufferInFrames; }
 
     /**
@@ -214,13 +234,12 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
      * (frameworks/base/media/java/android/media/AudioTrack.java, main, L2302).
      *
      * A REAL answer. AOSP documents the capacity as ">= the bufferSizeInBytes
-     * given at construction, converted to frames" for a streaming track, and
-     * exactly that for a static one. Our backend never enlarges the buffer
-     * after creation (see getBufferSizeInFrames above for why), so the
-     * construction-time frame count IS the capacity -- a legal, self-consistent
-     * device, not a placeholder.
+     * given at construction, converted to frames" for a streaming track: the
+     * request raised to the platform minimum, which is what the native track
+     * reports (see the constructor). Our backend never enlarges the buffer
+     * after creation, so that frame count IS the capacity.
      */
-    public int getBufferCapacityInFrames() { return bufferSizeInFrames; }
+    public int getBufferCapacityInFrames() { return capacityInFrames; }
 
     /**
      * Limit the effective buffer size the app may fill. API 24. AOSP
@@ -229,13 +248,10 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
      * otherwise the ACTUAL size adopted, which may differ from the request and
      * is capped at getBufferCapacityInFrames().
      *
-     * Implemented for real against the same field getBufferSizeInFrames reads,
-     * including the cap, so an app that shrinks its buffer to cut latency and
-     * then re-reads the size sees a coherent, believable device. The one thing
-     * the return value cannot promise is lower latency: our backend was created
-     * with the original frame count and is not re-opened here, so this changes
-     * the number the app is told, not the audio path. A backend that can
-     * genuinely resize should do so here and return what it achieved.
+     * Implemented for real: the native track lowers the amount a blocking
+     * write may queue ahead of the speaker, so an app that shrinks its buffer
+     * to cut latency gets lower latency, and getBufferSizeInFrames reports the
+     * size that was adopted.
      */
     public int setBufferSizeInFrames(int bufferSizeInFrames) {
         if (handle == 0) {
@@ -244,8 +260,17 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         if (bufferSizeInFrames < 0) {
             return ERROR_BAD_VALUE;
         }
-        this.effectiveBufferInFrames =
-                Math.min(bufferSizeInFrames, getBufferCapacityInFrames());
+        // AOSP: "return native_set_buffer_size_frames(bufferSizeInFrames);",
+        // which clips to [16, frameCount] (ClientProxy::setBufferSizeInFrames)
+        // and lowers the fill threshold blocking writes wait on, so a smaller
+        // size really is lower latency. The native side does both.
+        int adopted = Math.min(bufferSizeInFrames, getBufferCapacityInFrames());
+        try {
+            adopted = com.macapk.loader.NativeAudio.nativeSetBufferSize(handle, bufferSizeInFrames);
+        } catch (Throwable t) {
+            // older backend: report the clipped size only
+        }
+        this.effectiveBufferInFrames = adopted;
         return this.effectiveBufferInFrames;
     }
 
@@ -969,7 +994,19 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
         }
     }
 
-    public int getUnderrunCount() { return 0; }
+    /** AOSP: "return native_get_underrun_count();" -- underrun episodes the
+     *  mixer counted on this track since creation (ERROR_INVALID_OPERATION on
+     *  an uninitialized track is not reachable from Java there either, so 0
+     *  without a native side). The backend counts each starved render cycle
+     *  run once, as AudioFlinger does. */
+    public int getUnderrunCount() {
+        if (handle == 0) return 0;
+        try {
+            return com.macapk.loader.NativeAudio.nativeGetUnderrunCount(handle);
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
 
     /**
      * AOSP (frameworks/base .../AudioTrack.java, setPlaybackHeadPosition):

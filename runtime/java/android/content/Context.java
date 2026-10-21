@@ -2848,6 +2848,11 @@ public abstract class Context {
      *  so macapkRemoveContextRegistrations can unbind a destroyed activity's. */
     private static final java.util.Map<ServiceConnection, Context> sBoundBy =
         new java.util.IdentityHashMap<>();
+    /** Connections whose bind is queued on the main looper and has not run yet
+     *  (guarded by sBoundConnections). unbindService removes the entry, and the
+     *  queued bind then does nothing. */
+    private static final java.util.Map<ServiceConnection, Boolean> sPendingBinds =
+        new java.util.IdentityHashMap<>();
 
     /** AOSP bindService. Once the target Service's onBind() returns, the
      *  IBinder is delivered through LoadedApk.ServiceDispatcher: connected()
@@ -2899,6 +2904,27 @@ public abstract class Context {
         // IllegalArgumentException, not a quiet false.
         if (conn == null) throw new IllegalArgumentException("connection is null");
         if (intent == null) return false;
+        // AOSP bindService only resolves and returns: CREATE_SERVICE and
+        // BIND_SERVICE are main-looper messages that run after the caller has
+        // unwound (ActivityThread.H handleCreateService / handleBindService). We
+        // created + bound inline, so a Hilt @Singleton whose constructor binds
+        // (media3 MediaController.buildAsync in Libro.fm) had the Service's
+        // onCreate inject that singleton mid-construction and Dagger threw
+        // "Scoped provider was invoked recursively" -> black screen (issue #7).
+        // Resolve now (the return value), create + bind on the main looper.
+        if (android.app.ServiceRegistry.BIND_ASYNC) {
+            if (!android.app.ServiceRegistry.resolves(this, intent)) return false;
+            final Intent fi = intent; final int ff = flags;
+            final java.util.concurrent.Executor fe = executor; final ServiceConnection fc = conn;
+            synchronized (sBoundConnections) { sPendingBinds.put(fc, Boolean.TRUE); }
+            new android.os.Handler(getMainLooper()).post(() -> {
+                // unbindService before the bind ran: AOSP drops the dispatcher,
+                // so the connection never hears onServiceConnected.
+                synchronized (sBoundConnections) { if (sPendingBinds.remove(fc) == null) return; }
+                if (!macapkBindNow(fi, ff, fe, fc)) macapkDeliverNullBinding(fi, fe, fc);
+            });
+            return true;
+        }
         // A bind to a Service that is inside its own onCreate (it binds to
         // itself, as a media3 MediaSessionService building a MediaController for
         // its own SessionToken does) is a BIND_SERVICE message queued behind
@@ -2912,6 +2938,35 @@ public abstract class Context {
             return true;
         }
         return macapkBindNow(intent, flags, executor, conn);
+    }
+
+    /** AOSP LoadedApk.ServiceDispatcher.doConnected with a null binder: the
+     *  component resolved but its onBind() returned null, so bindService said
+     *  true and the connection hears onNullBinding (API 26+), never
+     *  onServiceConnected. */
+    private void macapkDeliverNullBinding(Intent intent,
+                                          java.util.concurrent.Executor executor,
+                                          final ServiceConnection conn) {
+        ComponentName c = intent.getComponent();
+        if (c == null) {
+            try {
+                android.content.pm.ResolveInfo ri = getPackageManager().resolveService(intent, 0);
+                if (ri != null && ri.serviceInfo != null && ri.serviceInfo.name != null) {
+                    c = new ComponentName(ri.serviceInfo.packageName != null
+                            ? ri.serviceInfo.packageName : getPackageName(), ri.serviceInfo.name);
+                }
+            } catch (Throwable ignored) {}
+        }
+        final ComponentName name = c;
+        Runnable deliver = () -> {
+            try { conn.onNullBinding(name); }
+            catch (Throwable t) {
+                try { com.macapk.loader.NativeLog.w("ctx", "onNullBinding(" + name + ") threw " + t); }
+                catch (Throwable ignored) {}
+            }
+        };
+        if (executor != null) executor.execute(deliver);
+        else new android.os.Handler(getMainLooper()).post(deliver);
     }
 
     /** bindService's inline half: bring the Service up, onBind, record the
@@ -2994,7 +3049,9 @@ public abstract class Context {
      *  crash real Android never produces. */
     public void    unbindService(ServiceConnection conn) {
         if (conn == null) return;
-        synchronized (sBoundConnections) { sBoundConnections.remove(conn); sBoundBy.remove(conn); }
+        synchronized (sBoundConnections) {
+            sBoundConnections.remove(conn); sBoundBy.remove(conn); sPendingBinds.remove(conn);
+        }
     }
     /** AOSP startService: instantiate (once) + drive the target Service's
      *  onCreate/onStartCommand. v1.0: was a no-op returning null, so

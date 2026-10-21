@@ -543,6 +543,11 @@ void Cocoa_setSystemFontsDir(JNIEnv* env, jclass, jstring dir_j) {
     }
 }
 
+// NativeCocoa.hostFontFile (host_fonts.cpp, CoreText). C linkage: this
+// declaration sits in an unnamed namespace, where a C++ name would get internal
+// linkage and never meet its definition.
+extern "C" jstring Cocoa_hostFontFile(JNIEnv* env, jclass, jstring ps_j);
+
 // Stage S3 of the shared-storage design: one volume path for every installed
 // app (SharedStorage.adoptCanonicalVolume). The shim's setter has existed since
 // S0 (bionic_shim.cpp __macapk_set_shared_storage_root); this is its caller.
@@ -857,6 +862,9 @@ const JNINativeMethod kNativeCocoaMethods[] = {
     {const_cast<char*>("setSystemFontsDir"),
      const_cast<char*>("(Ljava/lang/String;)V"),
      reinterpret_cast<void*>(Cocoa_setSystemFontsDir)},
+    {const_cast<char*>("hostFontFile"),
+     const_cast<char*>("(Ljava/lang/String;)Ljava/lang/String;"),
+     reinterpret_cast<void*>(Cocoa_hostFontFile)},
     {const_cast<char*>("setSharedStorageRoot"),
      const_cast<char*>("(Ljava/lang/String;)V"),
      reinterpret_cast<void*>(Cocoa_setSharedStorageRoot)},

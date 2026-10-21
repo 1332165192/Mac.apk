@@ -1362,7 +1362,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public boolean isHovered() { return hovered; }
     public void setHovered(boolean h) {
         if (!android.os.Looper.MACAPK_REAL_LOOPER) return;
-        if (hovered != h) { hovered = h; refreshDrawableState(); }
+        // AOSP View.setHovered (android14 :17898): refreshDrawableState, then
+        // the onHoverChanged hook.
+        if (hovered != h) { hovered = h; refreshDrawableState(); onHoverChanged(h); }
     }
     /** AOSP setDrawingCacheEnabled/isDrawingCacheEnabled (View.java:21112) --
      *  a plain mViewFlags bit. Deprecated since API 28 and we still build no
@@ -3126,13 +3128,17 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  callDragEventHandler. (Was a no-op until MacApkDragSession existed.) */
     public void setOnDragListener(OnDragListener l) { mOnDragListener = l; }
     OnDragListener mOnDragListener;
-    public void setOnHoverListener(OnHoverListener l) {}
+    /** AOSP ListenerInfo.mOnHoverListener, read by dispatchHoverEvent. Was a
+     *  discard. */
+    public void setOnHoverListener(OnHoverListener l) { mOnHoverListener = l; }
     public void setOnScrollChangeListener(OnScrollChangeListener l) {}
     public void setOnContextClickListener(OnContextClickListener l) {
         // AOSP stores it in ListenerInfo.mOnContextClickListener and
         // performContextClick() consults it; was a discard here, so the
         // listener could never fire. Storing it is what makes the AOSP
         // performContextClick() added below observable.
+        // AOSP View.java:7925: `if (!isContextClickable()) setContextClickable(true);`
+        if (!isContextClickable()) setContextClickable(true);
         macapkSetContextClickListener(l);
     }
     public void setOnGenericMotionListener(OnGenericMotionListener listener, Object discriminator) {}
@@ -4310,7 +4316,51 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                 && onGenericMotionListener.onGenericMotion(this, event)) {
             return true;
         }
-        return onGenericMotionEvent(event);
+        if (onGenericMotionEvent(event)) return true;
+        // AOSP View.dispatchGenericMotionEventInternal (android14 View.java:16788-16812):
+        // a SECONDARY (or stylus primary) BUTTON_PRESS on a context-clickable view
+        // performs the context click and holds the pressed state; its
+        // BUTTON_RELEASE ends it and makes the following UP skip the click.
+        final int actionButton = event.getActionButton();
+        switch (event.getActionMasked()) {
+            case android.view.MotionEvent.ACTION_BUTTON_PRESS:
+                if (isContextClickable() && !mInContextButtonPress && !mHasPerformedLongPress
+                        && (actionButton == android.view.MotionEvent.BUTTON_STYLUS_PRIMARY
+                        || actionButton == android.view.MotionEvent.BUTTON_SECONDARY)) {
+                    if (performContextClick(event.getX(), event.getY())) {
+                        mInContextButtonPress = true;
+                        setPressed(true);
+                        removeLongPressCallback();
+                        return true;
+                    }
+                }
+                break;
+            case android.view.MotionEvent.ACTION_BUTTON_RELEASE:
+                if (mInContextButtonPress && (actionButton == android.view.MotionEvent.BUTTON_STYLUS_PRIMARY
+                        || actionButton == android.view.MotionEvent.BUTTON_SECONDARY)) {
+                    mInContextButtonPress = false;
+                    mIgnoreNextUpEvent = true;
+                }
+                break;
+            default:
+                break;
+        }
+        return false;
+    }
+    /** AOSP View.mInContextButtonPress / mIgnoreNextUpEvent. */
+    private boolean mInContextButtonPress;
+    private boolean mIgnoreNextUpEvent;
+
+    /** AOSP View.performButtonActionOnTouchDown (android14 View.java:8224), @hide:
+     *  a MOUSE secondary-button press shows the context menu and consumes the
+     *  DOWN. */
+    protected boolean performButtonActionOnTouchDown(MotionEvent event) {
+        if (event.isFromSource(android.view.InputDevice.SOURCE_MOUSE)
+                && (event.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0) {
+            showContextMenu(event.getX(), event.getY());
+            return true;
+        }
+        return false;
     }
     public boolean onGenericMotionEvent(android.view.MotionEvent event) { return false; }
     /** AOSP View.cancelLongPress (View.java:18392-18401): a scrolling container
@@ -7054,6 +7104,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                     // that still showed one was the separate M18 ripple below,
                     // which runs only under MACAPK_REAL_LOOPER.
                     mHasPerformedLongPress = false;
+                    // AOSP View.onTouchEvent DOWN (android14 View.java:18167):
+                    // `if (performButtonActionOnTouchDown(event)) break;` -- a
+                    // mouse SECONDARY press opens the context menu and never
+                    // enters the pressed state, so its UP cannot click. Host
+                    // mice carry their real buttons since MACAPK_MOUSE_POINTER.
+                    if (performButtonActionOnTouchDown(ev)) break;
                     setPressed(true);
                     // M18: kick off a Material ripple from the touch point.
                     if (android.os.Looper.MACAPK_REAL_LOOPER) macapkStartRipple(ev.getX(), ev.getY());
@@ -7112,11 +7168,14 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                         // ... performClick ... }`. Without the gate, holding a
                         // list row would fire onItemLongClick AND onItemClick.
                         removeLongPressCallback();
-                        if (!mHasPerformedLongPress && !focusTaken) {
+                        // mIgnoreNextUpEvent: a context click consumed this
+                        // button's press (dispatchGenericMotionEvent below).
+                        if (!mHasPerformedLongPress && !mIgnoreNextUpEvent && !focusTaken) {
                             performClick();
                         }
                         mHasPerformedLongPress = false;
                     }
+                    mIgnoreNextUpEvent = false;
                     break;
                 case MotionEvent.ACTION_MOVE:
                     // AOSP View.java:18258-18272: "Be lenient about moving
@@ -9194,8 +9253,51 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         return who == getBackground();
     }
     public boolean isShowingLayoutBounds() { return false; }
-    public boolean dispatchHoverEvent(android.view.MotionEvent event) { return false; }
-    public boolean onHoverEvent(android.view.MotionEvent event) { return false; }
+    /** AOSP View.dispatchHoverEvent (android14 View.java:16829): the
+     *  OnHoverListener first (an enabled view only), then onHoverEvent. Both
+     *  used to answer false, so no view ever saw a hover (GitHub #25). */
+    public boolean dispatchHoverEvent(android.view.MotionEvent event) {
+        if (!HOVER_VIEWS) return false;
+        if (mOnHoverListener != null && isEnabled() && mOnHoverListener.onHover(this, event)) {
+            return true;
+        }
+        return onHoverEvent(event);
+    }
+    /** AOSP View.onHoverEvent (android14): a hoverable view (enabled and
+     *  clickable / long-clickable / context-clickable), or one already hovered,
+     *  takes the hovered state on ENTER and drops it on EXIT, offers the event to
+     *  onGenericMotionEvent for compatibility, and consumes it. The accessibility
+     *  hover events and the scrollbar wake-up are not modelled. */
+    public boolean onHoverEvent(android.view.MotionEvent event) {
+        if (!HOVER_VIEWS) return false;
+        if (isHoverable() || isHovered()) {
+            switch (event.getActionMasked()) {
+                case android.view.MotionEvent.ACTION_HOVER_ENTER: setHovered(true); break;
+                case android.view.MotionEvent.ACTION_HOVER_EXIT: setHovered(false); break;
+                default: break;
+            }
+            if (onGenericMotionListener != null && isEnabled()
+                    && onGenericMotionListener.onGenericMotion(this, event)) {
+                return true;
+            }
+            onGenericMotionEvent(event);
+            return true;
+        }
+        return false;
+    }
+    /** AOSP View.isHoverable (android14 View.java:17859). */
+    private boolean isHoverable() {
+        if (!isEnabled()) return false;
+        return isClickable() || isLongClickable() || isContextClickable();
+    }
+    /** AOSP @hide hasHoveredChild / pointInHoveredChild: a plain View has no
+     *  children; ViewGroup answers from its hover targets. */
+    protected boolean hasHoveredChild() { return false; }
+    protected boolean pointInHoveredChild(android.view.MotionEvent event) { return false; }
+    /** MACAPK_HOVER_EVENTS (default ON; =0 = the pre-change views, which never
+     *  answered a hover). Read by ViewGroup's hover routing and TouchDispatcher. */
+    public static final boolean HOVER_VIEWS = !"0".equals(System.getenv("MACAPK_HOVER_EVENTS"));
+    private OnHoverListener mOnHoverListener;
 
     // ---- content-translation (API 31): no on-device translator ---------------
     public void setViewTranslationCallback(android.view.translation.ViewTranslationCallback callback) { }

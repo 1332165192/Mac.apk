@@ -1811,11 +1811,22 @@ public final class Boot {
         }
         // /system/etc/fonts.xml + /system/fonts for a guest that draws text in
         // native code (Flutter's Skia reads them at engine start). Written once per
-        // font set, so a warm launch is one stat. Same timing rule as the calls
-        // above: after RegisterNatives, before any guest code runs.
+        // font set, so a warm launch is the CoreText name lookups for the CJK
+        // candidates plus a stat each (~20 ms on a cold process, under 1 ms once
+        // CoreText's registry is up; the line below logs it). Same timing rule as
+        // the calls above: after RegisterNatives, before any guest code runs.
         try {
-            String sysFonts = android.graphics.MacApkSystemFonts.materialize();
+            // The resolver is CoreText (NativeCocoa.hostFontFile): the CJK
+            // families come from the Mac's own Chinese / Hiragino / Apple SD
+            // Gothic Neo (android.graphics.MacApkHostFonts).
+            long sysFontsT0 = System.nanoTime();
+            String sysFonts = android.graphics.MacApkSystemFonts.materialize(ps -> {
+                try { return NativeCocoa.hostFontFile(ps); }
+                catch (Throwable t) { return null; }   // a runtime without the native
+            });
             if (sysFonts != null) NativeCocoa.setSystemFontsDir(sysFonts);
+            NativeLog.i(TAG, "system fonts: " + sysFonts + " ("
+                    + (System.nanoTime() - sysFontsT0) / 100_000 / 10.0 + " ms)");
         } catch (Throwable t) {
             NativeLog.w(TAG, "system fonts publish failed (/system/fonts stays absent): " + t);
         }

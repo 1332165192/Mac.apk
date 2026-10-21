@@ -109,6 +109,9 @@ set(MACAPK_RUNTIME_SOURCES
     src/window_policy.cpp
     src/window_traits.cpp
     src/native_methods.cpp
+    # NativeCocoa.hostFontFile: CoreText names the Mac's CJK font files for the
+    # native-stack fonts.xml (android.graphics.MacApkHostFonts).
+    src/host_fonts.cpp
     src/native_sqlite.cpp
     src/native_os.cpp
     # com.macapk.loader.NativeLinker: dlopen WITHOUT JNI_OnLoad, the Android
@@ -390,6 +393,9 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework QuartzCore"
     "-framework ImageIO"
     "-framework CoreGraphics"
+    # host_fonts.cpp (CTFontCreateWithName, kCTFontURLAttribute). In the dyld
+    # shared cache, so nothing is bundled.
+    "-framework CoreText"
     "-framework AVFAudio"
     "-framework AudioToolbox"
     # AudioConvertHostTimeToNanos (AudioTrack.getTimestamp()'s clock source,

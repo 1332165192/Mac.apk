@@ -3210,6 +3210,7 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
      *  ViewGroup overrides it to recurse so the whole departing subtree
      *  detaches. */
     private void macapkFinishRemoval(View child) {
+        if (View.HOVER_VIEWS && mFirstHoverTarget != null) cancelHoverTarget(child);
         child.setParent(null);
         child.macapkDispatchDetachedFromWindow();
         try { onViewRemoved(child); } catch (Throwable ignored) {}
@@ -3959,6 +3960,188 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
             }
         }
         return super.dispatchGenericPointerEvent(event);
+    }
+
+    // ------------------------------------------------------------------
+    // HOVER (GitHub #25, MACAPK_HOVER_EVENTS). AOSP ViewGroup.dispatchHoverEvent
+    // (android14-release ViewGroup.java:2113-2300), ported: the group keeps a
+    // list of hovered children (HoverTarget), sends a hover to the child under
+    // the pointer top-most first, SYNTHESIZES an ENTER from a MOVE for a child
+    // that was not hovered and an EXIT for each child the pointer has left, and
+    // hovers itself only when no child handled the event. View.dispatchHoverEvent
+    // used to answer false and this group had no override, so a hover never
+    // reached any view.
+    // ------------------------------------------------------------------
+    private static final class HoverTarget {
+        View child;
+        HoverTarget next;
+        HoverTarget(View child) { this.child = child; }
+    }
+    private HoverTarget mFirstHoverTarget;
+    private boolean mHoveredSelf;
+
+    @Override public boolean dispatchHoverEvent(MotionEvent event) {
+        if (!View.HOVER_VIEWS) return super.dispatchHoverEvent(event);
+        final int action = event.getAction();
+        final boolean interceptHover = onInterceptHoverEvent(event);
+        event.setAction(action);   // restore in case it was changed
+        MotionEvent eventNoHistory = event;
+        boolean handled = false;
+
+        HoverTarget firstOldHoverTarget = mFirstHoverTarget;
+        mFirstHoverTarget = null;
+        if (!interceptHover && action != MotionEvent.ACTION_HOVER_EXIT) {
+            final float x = event.getX();
+            final float y = event.getY();
+            final int childrenCount = children.size();
+            if (childrenCount != 0) {
+                final java.util.ArrayList<View> preorderedList = buildOrderedChildList();
+                final boolean customOrder = preorderedList == null
+                        && isChildrenDrawingOrderEnabled();
+                HoverTarget lastHoverTarget = null;
+                try {
+                    for (int i = childrenCount - 1; i >= 0; i--) {
+                        final int childIndex =
+                                getAndVerifyPreorderedIndex(childrenCount, i, customOrder);
+                        final View child = getAndVerifyPreorderedView(preorderedList, childIndex);
+                        if (child == null || !child.canReceivePointerEvents()
+                                || !isTransformedTouchPointInView(x, y, child, null)) {
+                            continue;
+                        }
+                        // Reuse the child's target from the old list if it was hovered.
+                        HoverTarget hoverTarget = firstOldHoverTarget;
+                        final boolean wasHovered;
+                        for (HoverTarget predecessor = null; ;) {
+                            if (hoverTarget == null) {
+                                hoverTarget = new HoverTarget(child);
+                                wasHovered = false;
+                                break;
+                            }
+                            if (hoverTarget.child == child) {
+                                if (predecessor != null) predecessor.next = hoverTarget.next;
+                                else firstOldHoverTarget = hoverTarget.next;
+                                hoverTarget.next = null;
+                                wasHovered = true;
+                                break;
+                            }
+                            predecessor = hoverTarget;
+                            hoverTarget = hoverTarget.next;
+                        }
+                        if (lastHoverTarget != null) lastHoverTarget.next = hoverTarget;
+                        else mFirstHoverTarget = hoverTarget;
+                        lastHoverTarget = hoverTarget;
+
+                        if (action == MotionEvent.ACTION_HOVER_ENTER) {
+                            if (!wasHovered) {
+                                handled |= dispatchTransformedGenericPointerEvent(event, child);
+                            }
+                        } else if (action == MotionEvent.ACTION_HOVER_MOVE) {
+                            if (!wasHovered) {
+                                // Synthesize an enter from a move.
+                                eventNoHistory = noHistory(eventNoHistory);
+                                eventNoHistory.setAction(MotionEvent.ACTION_HOVER_ENTER);
+                                handled |= dispatchTransformedGenericPointerEvent(eventNoHistory, child);
+                                eventNoHistory.setAction(action);
+                                handled |= dispatchTransformedGenericPointerEvent(eventNoHistory, child);
+                            } else {
+                                handled |= dispatchTransformedGenericPointerEvent(event, child);
+                            }
+                        }
+                        if (handled) break;
+                    }
+                } finally {
+                    if (preorderedList != null) preorderedList.clear();
+                }
+            }
+        }
+
+        // Exit every previously hovered child that is no longer hovered.
+        while (firstOldHoverTarget != null) {
+            final View child = firstOldHoverTarget.child;
+            if (action == MotionEvent.ACTION_HOVER_EXIT) {
+                handled |= dispatchTransformedGenericPointerEvent(event, child);
+            } else {
+                // Synthesize an exit from a move or enter; the result is ignored
+                // because hover focus has moved to a different view.
+                if (action == MotionEvent.ACTION_HOVER_MOVE) {
+                    final boolean hoverExitPending = event.isHoverExitPending();
+                    event.setHoverExitPending(true);
+                    dispatchTransformedGenericPointerEvent(event, child);
+                    event.setHoverExitPending(hoverExitPending);
+                }
+                eventNoHistory = noHistory(eventNoHistory);
+                eventNoHistory.setAction(MotionEvent.ACTION_HOVER_EXIT);
+                dispatchTransformedGenericPointerEvent(eventNoHistory, child);
+                eventNoHistory.setAction(action);
+            }
+            firstOldHoverTarget = firstOldHoverTarget.next;
+        }
+
+        // Hover the group itself only when no child took the event and the group
+        // is not itself being exited.
+        final boolean newHoveredSelf = !handled
+                && action != MotionEvent.ACTION_HOVER_EXIT && !event.isHoverExitPending();
+        if (newHoveredSelf == mHoveredSelf) {
+            if (newHoveredSelf) handled |= super.dispatchHoverEvent(event);
+        } else {
+            if (mHoveredSelf) {
+                if (action == MotionEvent.ACTION_HOVER_EXIT) {
+                    handled |= super.dispatchHoverEvent(event);
+                } else {
+                    if (action == MotionEvent.ACTION_HOVER_MOVE) super.dispatchHoverEvent(event);
+                    eventNoHistory = noHistory(eventNoHistory);
+                    eventNoHistory.setAction(MotionEvent.ACTION_HOVER_EXIT);
+                    super.dispatchHoverEvent(eventNoHistory);
+                    eventNoHistory.setAction(action);
+                }
+                mHoveredSelf = false;
+            }
+            if (newHoveredSelf) {
+                if (action == MotionEvent.ACTION_HOVER_ENTER) {
+                    handled |= super.dispatchHoverEvent(event);
+                    mHoveredSelf = true;
+                } else if (action == MotionEvent.ACTION_HOVER_MOVE) {
+                    eventNoHistory = noHistory(eventNoHistory);
+                    eventNoHistory.setAction(MotionEvent.ACTION_HOVER_ENTER);
+                    handled |= super.dispatchHoverEvent(eventNoHistory);
+                    eventNoHistory.setAction(action);
+                    handled |= super.dispatchHoverEvent(eventNoHistory);
+                    mHoveredSelf = true;
+                }
+            }
+        }
+        return handled;
+    }
+    /** AOSP obtainMotionEventNoHistoryOrSelf: a private copy the synthesized
+     *  enter/exit actions can be written into without touching the caller's. */
+    private static MotionEvent noHistory(MotionEvent e) {
+        return e.macapkIsHoverCopy ? e : MotionEvent.macapkHoverCopy(e);
+    }
+    @Override protected boolean hasHoveredChild() {
+        return View.HOVER_VIEWS && mFirstHoverTarget != null;
+    }
+    @Override protected boolean pointInHoveredChild(MotionEvent event) {
+        return mFirstHoverTarget != null
+                && isTransformedTouchPointInView(event.getX(), event.getY(), mFirstHoverTarget.child, null);
+    }
+    /** AOSP cancelHoverTarget (android14 :2311): a removed child that was hovered
+     *  gets one HOVER_EXIT and leaves the list. */
+    private void cancelHoverTarget(View view) {
+        HoverTarget predecessor = null;
+        HoverTarget target = mFirstHoverTarget;
+        while (target != null) {
+            final HoverTarget next = target.next;
+            if (target.child == view) {
+                if (predecessor == null) mFirstHoverTarget = next; else predecessor.next = next;
+                final long now = android.os.SystemClock.uptimeMillis();
+                MotionEvent event = MotionEvent.obtain(now, now, MotionEvent.ACTION_HOVER_EXIT, 0f, 0f, 0);
+                event.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN);
+                try { view.dispatchHoverEvent(event); } catch (Throwable ignored) {}
+                return;
+            }
+            predecessor = target;
+            target = next;
+        }
     }
 
     /** AOSP :2589-2604, with the same child-offset rules as

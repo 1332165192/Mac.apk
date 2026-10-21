@@ -4441,9 +4441,96 @@ public class Canvas {
         if (g == null || path == null || !REAL_CLIP) return true;
         java.awt.Shape s = path.macapkShape();
         if (s == null) return true;
-        g.clip(s);
+        if (DIAG_CLIP) {
+            long t0 = System.nanoTime();
+            int how = macapkIntersectClip(s);
+            long dt = System.nanoTime() - t0;
+            sDiagClipN++; sDiagClipNs += dt;
+            if (how == 2) { sDiagClipSlow++; sDiagClipSlowNs += dt; }
+            if (how == 1) sDiagClipShort++;
+            long now = System.currentTimeMillis();
+            if (now - sDiagClipT > 2000) {
+                com.macapk.loader.NativeLog.i("Mac.apk.DiagClip", "clipPath n=" + sDiagClipN
+                    + " ms=" + (sDiagClipNs / 1000000) + " contained=" + sDiagClipShort
+                    + " area=" + sDiagClipSlow + " areaMs=" + (sDiagClipSlowNs / 1000000));
+                sDiagClipT = now; sDiagClipN = 0; sDiagClipNs = 0; sDiagClipSlow = 0;
+                sDiagClipSlowNs = 0; sDiagClipShort = 0;
+            }
+            return true;
+        }
+        macapkIntersectClip(s);
         return true;
     }
+
+    /** Intersect the clip with `s` (user space), as g.clip(s) does, but without
+     *  java.awt.geom.Area when one shape provably contains the other.
+     *
+     *  WHY (v1.0.2284, Rhythm, issue #11 "significant slowdowns"). Graphics2D.clip
+     *  intersects two non-rectangular shapes by building java.awt.geom.Areas
+     *  (SunGraphics2D.intersectShapes -> intersectByArea): curve subdivision,
+     *  edge sorting and pruning, about 1 ms per call for two rounded shapes.
+     *  Compose clips nearly every card, button and icon to its Shape
+     *  (Modifier.clip / graphicsLayer clip, RenderNode clipToOutline), and those
+     *  clips NEST, so every frame paid hundreds of Area intersections: measured
+     *  on Rhythm's Settings screen, 579 of them took 626 ms out of 2 s (MACAPK_DIAG_CLIP),
+     *  and each frame drew in 37-40 ms where the same screen's rectangle-clipped
+     *  frames drew in 5. A nested clip is almost always CONTAINED in its parent's,
+     *  and then the intersection is exactly the inner shape, so no Area is needed:
+     *    - the current clip contains s's bounds: the result is s (setClip(s));
+     *    - s contains the current clip's bounds: the result is the current clip.
+     *  Shape.contains(Rectangle2D) may answer false conservatively (Path2D does
+     *  near curves) but never true wrongly, so both shortcuts are exact; anything
+     *  else still goes through g.clip(s). Returns 0 rect fast path / no clip,
+     *  1 shortcut, 2 the Area path. Gate MACAPK_CLIP_CONTAIN (default on). */
+    private int macapkIntersectClip(java.awt.Shape s) {
+        if (CLIP_CONTAIN && !(s instanceof java.awt.geom.Rectangle2D)) {
+            java.awt.Shape cur = g.getClip();
+            if (cur != null && !(cur instanceof java.awt.geom.Rectangle2D)) {
+                try {
+                    java.awt.geom.Rectangle2D sb = s.getBounds2D();
+                    if (cur.contains(sb)) { g.setClip(s); return 1; }
+                    if (s.contains(cur.getBounds2D())) return 1;
+                    if (CLIP_FLATTEN) {
+                        // Area intersects CUBIC curves by recursive subdivision
+                        // (sun.awt.geom.Order3.refine / TforY, the top frames of
+                        // the profile); on straight segments it is far cheaper.
+                        // Java2D shape clips are not antialiased -- a pixel is in
+                        // when its centre is -- so flattening both outlines to a
+                        // quarter of a DEVICE pixel moves the clip edge by at most
+                        // that, which can change only pixels whose centres sit
+                        // within 0.25 px of the curve.
+                        double sc = 1.0;
+                        try {
+                            java.awt.geom.AffineTransform at = g.getTransform();
+                            sc = Math.max(1e-6, Math.sqrt(Math.abs(at.getDeterminant())));
+                        } catch (Throwable ignored) {}
+                        double flat = 0.25 / sc;
+                        java.awt.geom.Area a = new java.awt.geom.Area(flattened(cur, flat));
+                        a.intersect(new java.awt.geom.Area(flattened(s, flat)));
+                        g.setClip(a);
+                        return 2;
+                    }
+                } catch (Throwable ignored) {
+                    // fall through to the general intersection
+                }
+                g.clip(s);
+                return 2;
+            }
+        }
+        g.clip(s);
+        return 0;
+    }
+    private static final boolean CLIP_CONTAIN =
+        !"0".equals(System.getenv("MACAPK_CLIP_CONTAIN"));
+    private static final boolean CLIP_FLATTEN =
+        !"0".equals(System.getenv("MACAPK_CLIP_FLATTEN"));
+    private static java.awt.Shape flattened(java.awt.Shape sh, double flatness) {
+        java.awt.geom.Path2D.Double p = new java.awt.geom.Path2D.Double();
+        p.append(sh.getPathIterator(null, flatness), false);
+        return p;
+    }
+    private static final boolean DIAG_CLIP = System.getenv("MACAPK_DIAG_CLIP") != null;
+    private static long sDiagClipN, sDiagClipNs, sDiagClipSlow, sDiagClipSlowNs, sDiagClipT, sDiagClipShort;
     public boolean getClipBounds(Rect bounds) {
         if (bounds == null) return true;
         if (g == null) {

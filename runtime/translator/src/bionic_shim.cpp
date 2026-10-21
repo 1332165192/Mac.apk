@@ -34254,6 +34254,12 @@ static rt_write_short_fn g_rt_write_s  = nullptr;
 static rt_write_float_fn g_rt_write_f  = nullptr;
 static rt_void_fn        g_rt_play = nullptr, g_rt_stop = nullptr, g_rt_release = nullptr;
 static rt_int_fn         g_rt_buffered = nullptr;
+// The track's frameCount / buffer size (MACAPK_AUDIO_AOSP_FRAMECOUNT in
+// audio_backend.mm). Optional: an older runtime lacks them, and AAudio then
+// keeps answering from its own fields.
+typedef int     (*rt_set_int_fn)(int64_t, int);
+static rt_int_fn         g_rt_capacity = nullptr, g_rt_bufsize = nullptr;
+static rt_set_int_fn     g_rt_set_bufsize = nullptr;
 static bool aaudio_rt_ready() {
     // C++11 magic-static init is thread-safe.
     static bool ok = []{
@@ -34264,6 +34270,9 @@ static bool aaudio_rt_ready() {
         g_rt_stop    = (rt_void_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_stop");
         g_rt_release = (rt_void_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_release");
         g_rt_buffered = (rt_int_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_buffered");
+        g_rt_capacity = (rt_int_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_buffer_capacity");
+        g_rt_bufsize  = (rt_int_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_buffer_size");
+        g_rt_set_bufsize = (rt_set_int_fn)dlsym(RTLD_DEFAULT, "macapk_audio_stream_set_buffer_size");
         return g_rt_create && g_rt_write_s && g_rt_write_f
             && g_rt_play && g_rt_stop && g_rt_release;
     }();
@@ -34556,7 +34565,20 @@ extern "C" int  macapk_AAudioStreamBuilder_openStream(void* b, void** stream) {
     // stays 0 and the honest-open branch below answers as a device would.
     if (aaudio_rt_ready()) {
         int enc = (s->format == 2) ? 4 /*ENC_PCM_FLOAT*/ : 2 /*ENC_PCM_16BIT*/;
-        s->handle = g_rt_create(s->sample_rate, s->channels, enc, s->buffer_capacity);
+        // The builder's capacity, or 0 when the app set none: AOSP
+        // AudioStreamTrack::open passes "size_t frameCount =
+        // (size_t)builder.getBufferCapacity();" (0 = unspecified) to the
+        // AudioTrack, and AudioFlinger raises it to the platform minimum.
+        // The stream's capacity is then what the track got
+        // (getBufferCapacityFromDevice = mAudioTrack->frameCount()). Passing
+        // our 2048 default here is what used to queue ~340 ms of audio ahead
+        // of the speaker in write mode (MACAPK_AUDIO_AOSP_FRAMECOUNT).
+        s->handle = g_rt_create(s->sample_rate, s->channels, enc,
+                                bld->buffer_capacity > 0 ? bld->buffer_capacity : 0);
+        if (s->handle && g_rt_capacity) {
+            int cap = g_rt_capacity(s->handle);
+            if (cap > 0) s->buffer_capacity = cap;
+        }
     }
     if (s->handle == 0 && macapk_audio_honest_open()) {
         // No engine stream: answer like AAudioStreamBuilder_openStream on a
@@ -34596,7 +34618,16 @@ extern "C" int  macapk_AAudioStream_close(void* st) {
     return 0;
 }
 extern "C" int  macapk_AAudioStream_getBufferCapacityInFrames(void* st) { return st ? ((AAudioStreamImpl*)st)->buffer_capacity : 2048; }
-extern "C" int  macapk_AAudioStream_getBufferSizeInFrames(void* st) { return st ? ((AAudioStreamImpl*)st)->buffer_capacity : 2048; }
+extern "C" int  macapk_AAudioStream_getBufferSizeInFrames(void* st) {
+    AAudioStreamImpl* s = (AAudioStreamImpl*)st;
+    if (!s) return 2048;
+    // AudioStreamTrack::getBufferSize = mAudioTrack->getBufferSizeInFrames().
+    if (aaudio_rt_ready() && s->handle && g_rt_bufsize) {
+        int n = g_rt_bufsize(s->handle);
+        if (n > 0) return n;
+    }
+    return s->buffer_capacity;
+}
 extern "C" int  macapk_AAudioStream_getChannelCount(void* st) { return st ? ((AAudioStreamImpl*)st)->channels : 2; }
 extern "C" int  macapk_AAudioStream_getFormat(void* st) { return st ? ((AAudioStreamImpl*)st)->format : 1; }
 extern "C" int  macapk_AAudioStream_getFramesPerBurst(void* st) { return st ? ((AAudioStreamImpl*)st)->frames_per_burst : 256; }
@@ -34633,7 +34664,22 @@ extern "C" int  macapk_AAudioStream_requestStop(void* st) {
     std::fprintf(stderr, "[aaudio] requestStop h=%lld\n", (long long)s->handle);
     return 0;
 }
-extern "C" int  macapk_AAudioStream_setBufferSizeInFrames(void* st, int n) { return st ? ((AAudioStreamImpl*)st)->buffer_capacity : n; }
+// AOSP AudioStreamTrack::setBufferSize (media/libaaudio/src/legacy/
+// AudioStreamTrack.cpp:470-481): "// Do not ask for less than one burst.
+// if (requestedFrames < getFramesPerBurst()) requestedFrames =
+// getFramesPerBurst(); ssize_t result =
+// mAudioTrack->setBufferSizeInFrames(requestedFrames);" -- the size the track
+// adopted, clipped to its frameCount. This is the call an app makes to get low
+// latency (Oboe's tuner does it), so it now really resizes the fill.
+extern "C" int  macapk_AAudioStream_setBufferSizeInFrames(void* st, int n) {
+    AAudioStreamImpl* s = (AAudioStreamImpl*)st;
+    if (!s) return n;
+    if (aaudio_rt_ready() && s->handle && g_rt_set_bufsize) {
+        int req = n < s->frames_per_burst ? s->frames_per_burst : n;
+        return g_rt_set_bufsize(s->handle, req);
+    }
+    return s->buffer_capacity;
+}
 
 extern "C" void macapk_AAudioStreamBuilder_setChannelCount(void* b, int c) { if (b) ((AAudioBuilder*)b)->channels = c; }
 extern "C" void macapk_AAudioStreamBuilder_setDeviceId(void*, int) {}
@@ -35469,7 +35515,13 @@ static SLresult sl_obj_Realize(void* self, SLuint32) {
     o->realized = 1;
     if (o->type == SLOBJ_PLAYER && o->handle == 0 && aaudio_rt_ready()) {
         int enc = (o->format == 2) ? 4 : 2;
-        o->handle = g_rt_create(o->sample_rate, o->channels, enc, 4096);
+        // frameCount 0, as AOSP's OpenSL ES player creates its AudioTrack
+        // (frameworks/wilhelm src/android/AudioPlayer_to_android.cpp:1650,
+        // "0, // frameCount"): AudioFlinger then gives it the platform
+        // minimum, and the app's own queued buffers are the rest of its
+        // buffering. This used to be 4096, which the runtime floored to
+        // ~340 ms of queued audio (MACAPK_AUDIO_AOSP_FRAMECOUNT).
+        o->handle = g_rt_create(o->sample_rate, o->channels, enc, 0);
         if (sl_trace())
             std::fprintf(stderr, "[opensl] player Realize -> stream h=%lld\n",
                          (long long)o->handle);
@@ -42290,6 +42342,31 @@ static std::string macapk_arm64_remap_path_unguarded(const char* p) {
                 && s[rr.size() - 1] == '/')
                 return macapk_arm64_remap_path_unguarded(("/" + s).c_str());
         }
+    }
+    // MACAPK_HIDE_HOST_OS_VERSION (default ON; =0 lets the guest read the host's
+    // files again). /System/Library/CoreServices holds the files that NAME the host
+    // OS (SystemVersion.plist, SystemVersionCompat.plist, ServerVersion.plist), and
+    // no Android device has that directory. An unrecognised absolute path otherwise
+    // reaches the host unchanged, so a guest that probes for macOS found it: CPython's
+    // platform.mac_ver() reads SystemVersion.plist, and Ren'Py (renpy/__init__.py)
+    // tests mac_ver() BEFORE ANDROID_PRIVATE, so every Ren'Py 7/8 APK decided it was
+    // on a Mac, never registered its assets/x-game prefixes and quit (GitHub #38).
+    // The path is rebased under the android root, where nothing lives, so every
+    // shim that goes through this remap (open, fopen, stat, access, opendir, ...)
+    // answers ENOENT the way a device does. The match is case-insensitive because
+    // the host volume is.
+    {
+        static const bool hide_on = [] {
+            const char* e = std::getenv("MACAPK_HIDE_HOST_OS_VERSION");
+            return !(e && e[0] == '0');
+        }();
+        static const char kCore[] = "/System/Library/CoreServices";
+        const size_t kl = sizeof(kCore) - 1;
+        const char* r0 = __macapk_get_android_root();
+        if (hide_on && r0 && *r0 && s.size() >= kl
+            && strncasecmp(s.c_str(), kCore, kl) == 0
+            && (s.size() == kl || s[kl] == '/'))
+            return std::string(r0) + s;
     }
     // Android's system CA store (/system/etc/security/cacerts, and the Android 14+
     // conscrypt APEX copy), served from the Mac's own trusted roots. A native TLS

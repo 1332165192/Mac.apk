@@ -188,6 +188,38 @@ public final class ServiceRegistry {
     static final boolean REENTRY_DEFER =
         !"0".equals(System.getenv("MACAPK_SVC_REENTRY_DEFER"));
 
+    /** bindService never creates or binds the Service inside the caller's stack
+     *  (default ON). On a device bindService only asks the ActivityManager,
+     *  which resolves the component and returns; CREATE_SERVICE and BIND_SERVICE
+     *  then arrive as main-looper messages (ActivityThread.H) after the caller
+     *  has unwound. Ours ran ensure() + onBind inline, so a Hilt @Singleton whose
+     *  constructor binds (media3 MediaController.Builder(...).buildAsync() in
+     *  Libro.fm's MediaSessionControllerProviderImpl) had the Service's onCreate
+     *  inject that same singleton while it was still being constructed, and
+     *  Dagger's DoubleCheck threw "Scoped provider was invoked recursively".
+     *  MACAPK_SVC_BIND_ASYNC=0: the pre-fix inline bind, for one A/B. */
+    public static final boolean BIND_ASYNC =
+        !"0".equals(System.getenv("MACAPK_SVC_BIND_ASYNC"));
+
+    /** bindService's synchronous half: does this Intent name a Service we can
+     *  bring up? AOSP's bindService returns false exactly when
+     *  ActiveServices.retrieveServiceLocked finds nothing, before anything is
+     *  constructed; this answers the same question without constructing:
+     *  a resolvable class name, not declared-but-disabled, and loadable. */
+    public static boolean resolves(Context ctx, Intent intent) {
+        String cls = classNameOf(intent);
+        if (cls == null) return false;
+        if (sLive.containsKey(cls)) return true;
+        if (macapkIsDeclaredButDisabled(ctx, cls)) return false;
+        try {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            if (cl == null) cl = ServiceRegistry.class.getClassLoader();
+            return Service.class.isAssignableFrom(Class.forName(cls, false, cl));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** True when the Service this Intent names is inside its own onCreate, so
      *  a bind or start for it must be queued behind that onCreate (see
      *  sCreating). Context.bindService asks this before binding inline. */
